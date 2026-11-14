@@ -582,7 +582,11 @@ class MythicItemFixer : JavaPlugin() {
             )
         }
         try {
-            val loaded = CurrentLegacyDefinitionMatcher.load(definitions, itemConverter.bridge::currentItem)
+            val loaded = CurrentLegacyDefinitionMatcher.load(
+                definitions,
+                itemConverter.bridge::currentItem,
+                itemConverter.bridge.allIds(),
+            )
             legacyMatcher = loaded
             legacyMatcherError = null
             itemConverter.setLegacyNames(loaded::legacyNameFor)

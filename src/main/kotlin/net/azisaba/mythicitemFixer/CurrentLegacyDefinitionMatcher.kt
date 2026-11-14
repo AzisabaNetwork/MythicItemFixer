@@ -40,6 +40,9 @@ class CurrentLegacyDefinitionMatcher private constructor() {
     private val headSkinsById = HashMap<String, String>()
     private val legacyNamesById = HashMap<String, String>()
     private val ambiguous = HashSet<Signature>()
+    /** Plain signatures of what the current MythicMobs generates (`/mm i get`), the fallback. */
+    private val currentIds = HashMap<Signature, String>()
+    private val currentAmbiguous = HashSet<Signature>()
     private val plainAmbiguous = HashSet<Signature>()
     private val skinlessHeadAmbiguous = HashSet<Signature>()
     private var files = 0
@@ -56,6 +59,7 @@ class CurrentLegacyDefinitionMatcher private constructor() {
         ) {
             id = skinlessHeadIds[signature.plain().withoutSkin()]
         }
+        if (id == null) id = currentIds[signature.plain()]
         if (id == null) return null
         val traits = traitsById[id]
         if (traits != null && !traits.allows(item)) {
@@ -74,6 +78,7 @@ class CurrentLegacyDefinitionMatcher private constructor() {
 
     fun summary(): String =
         "読込ファイル ${files}件（構文エラー ${invalidFiles}件）、一意な旧定義 ${ids.size}件、" +
+            "現行定義 ${currentIds.size}件（重複 ${currentAmbiguous.size}件）、" +
             "同じ見た目の重複 ${ambiguous.size}件、現行MMに無いID ${missingCurrent}件、" +
             "特徴の不一致で除外 ${rejected}件"
 
@@ -105,6 +110,20 @@ class CurrentLegacyDefinitionMatcher private constructor() {
         }
     }
 
+    /** Indexes the item the current MythicMobs generates for [id], so items that only match it are found too. */
+    private fun addCurrent(id: String, currentItem: (String) -> ItemStack?) {
+        val first = currentItem(id) ?: return
+        if (first.type.isAir) return
+        val signature = Signature.fromItem(first)?.plain() ?: return
+        // A definition with random name/lore has no stable look to match against.
+        val second = currentItem(id) ?: return
+        if (Signature.fromItem(second)?.plain() != signature) return
+        if (id !in traitsById) traitsById[id] = Traits.fromCurrent(first)
+        val previous = currentIds[signature]
+        if (previous == null) currentIds[signature] = id
+        else if (!previous.equals(id, ignoreCase = true)) currentAmbiguous.add(signature)
+    }
+
     /** What a definition fixes on every item it generates, used to rule out look-alikes. */
     private class Traits(
         /** Model of the old definition (restored onto items that lost it). */
@@ -123,6 +142,17 @@ class CurrentLegacyDefinitionMatcher private constructor() {
         }
 
         companion object {
+            fun fromCurrent(current: ItemStack): Traits {
+                val meta = current.itemMeta
+                val traits = Traits(
+                    null,
+                    meta?.isUnbreakable == true,
+                    (meta as? LeatherArmorMeta)?.color,
+                )
+                if (meta != null && meta.hasCustomModelData()) traits.models.add(meta.customModelData)
+                return traits
+            }
+
             fun fromDefinition(config: Map<*, *>, current: ItemStack): Traits {
                 val rawModel = if ("Model" in config) config["Model"] else config["CustomModelData"]
                 val model = integer(rawModel)
@@ -229,10 +259,13 @@ class CurrentLegacyDefinitionMatcher private constructor() {
          */
         @Throws(IOException::class)
         @JvmStatic
-        fun load(directory: File, currentItem: (String) -> ItemStack?): CurrentLegacyDefinitionMatcher {
-            if (!directory.isDirectory) throw IOException("Legacy Items directory not found: $directory")
+        fun load(
+            directory: File,
+            currentItem: (String) -> ItemStack?,
+            currentIds: Collection<String> = emptyList(),
+        ): CurrentLegacyDefinitionMatcher {
             val result = CurrentLegacyDefinitionMatcher()
-            Files.walk(directory.toPath()).use { paths ->
+            if (directory.isDirectory) Files.walk(directory.toPath()).use { paths ->
                 paths.filter { Files.isRegularFile(it) }
                     .filter { it.toString().endsWith(".yml") || it.toString().endsWith(".yaml") }
                     .forEach { path ->
@@ -252,8 +285,20 @@ class CurrentLegacyDefinitionMatcher private constructor() {
             for (signature in result.ambiguous) result.ids.remove(signature)
             for (signature in result.plainAmbiguous) result.plainIds.remove(signature)
             for (signature in result.skinlessHeadAmbiguous) result.skinlessHeadIds.remove(signature)
-            if (result.files == 0 || result.ids.isEmpty()) {
-                throw IOException("No usable legacy MM definitions in $directory")
+            for (id in currentIds) {
+                try {
+                    result.addCurrent(id, currentItem)
+                } catch (_: RuntimeException) {
+                }
+            }
+            // A look shared by an old and a current definition of different IDs is not unique either.
+            for ((signature, id) in result.plainIds) {
+                val current = result.currentIds[signature]
+                if (current != null && !current.equals(id, ignoreCase = true)) result.currentAmbiguous.add(signature)
+            }
+            for (signature in result.currentAmbiguous) result.currentIds.remove(signature)
+            if (result.ids.isEmpty() && result.currentIds.isEmpty()) {
+                throw IOException("No usable MM definitions (legacy: $directory, current: ${currentIds.size} IDs)")
             }
             return result
         }

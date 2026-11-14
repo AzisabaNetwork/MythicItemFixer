@@ -16,6 +16,9 @@ class MythicItemBridge private constructor(private val itemManager: ItemExecutor
         return LegacyItemData(value)
     }
 
+    /** Every item ID the current MythicMobs knows. */
+    fun allIds(): List<String> = itemManager.items.map { it.internalName }
+
     /** A freshly generated item of the current definition, or null when MythicMobs has no such ID. */
     fun currentItem(id: String): ItemStack? =
         try {
