@@ -1,0 +1,25 @@
+scan-online-players-on-enable: true
+repair-inventory-on-join: true
+# Players are scanned once on the next tick and again after this delay. The second
+# pass catches inventories restored or modified by other login listeners.
+repair-inventory-on-join-delay-ticks: 20
+# Also scan after changing worlds. This is safe because only untagged, uniquely
+# matched legacy items are changed.
+repair-inventory-on-world-change: true
+# Also repair the player's inventory right after they close a chest or other container, so
+# items just taken out (which may have lost their ID) are fixed and stack with /mm i get items.
+repair-inventory-on-close: true
+scan-loaded-chunks-on-enable: true
+scan-newly-loaded-chunks: true
+scan-offline-playerdata-on-enable: true
+scan-all-world-chunks-on-enable: false
+online-player-scan-interval-ticks: 200
+chunks-per-tick: 2
+full-world-chunks-per-tick: 1
+log-converted-items: false
+# MMIDs this plugin will never fix (no ID from the old tag, no ID/Model/skin/attribute/name repair).
+# Matching ignores case. An entry ending in * matches every MMID starting with it.
+#   - SomeItem      exact match
+#   - Event_*       prefix match (Event_Sword, Event_Hat, ...)
+excluded-mmids:
+  - "FFGGR_Under_*"
