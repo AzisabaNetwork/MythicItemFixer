@@ -2,7 +2,7 @@ name: MythicItemFixer
 version: '${version}'
 main: net.azisaba.mythicitemFixer.MythicItemFixer
 api-version: '1.21.11'
-softdepend: [MythicMobs]
+softdepend: [MythicMobs, StorageBox]
 authors: [ AzisabaNetwork ]
 website: https://github.com/AzisabaNetwork/MythicItemFixer
 description: Keeps MythicMobs 4.12 item IDs working on 1.21.11 / MythicMobs 5.

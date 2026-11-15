@@ -7,11 +7,13 @@ repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
     maven("https://mvn.lumine.io/repository/maven-public/")
+    maven("https://repo.azisaba.net/repository/maven-public/")
 }
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     compileOnly("io.lumine:Mythic-Dist:5.14.0")
+    compileOnly("xyz.acrylicstyle:StorageBox:1.5.6")
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
 }
 

@@ -15,6 +15,9 @@ MythicMobs 5 はアイテムの `mythicmobs:type`(PDC)でMMアイテムを見分
 - 開いたインベントリ、拾った・捨てたアイテム
 - 読み込まれたチャンクのチェストなど、ドロップ・額縁・Mobの装備(エンティティはチャンクより遅れて読み込まれるので、その時点で処理)
 - シュルカーボックスとバンドルの中身
+- StorageBox(`xyz.acrylicstyle.storageBox`)の箱の中身。箱はインベントリの外にアイテムを持つため、
+  プレイヤーのインベントリ走査・`/mmidfix scan`・`/mmidfix worldscan`で箱を見つけたときに中身へ同じ処理を行い、
+  StorageBoxのAPIで箱を書き戻します
 - オフラインプレイヤーの `world/playerdata/*.dat`(起動時に自動。変更前のファイルは `.mmidcompat.bak` に一度だけ保存。処理中は新規ログインを待たせます)
 - `/mmidfix worldscan` で全リージョンのチャンクを順に読み込んで処理(`full-world-chunks-per-tick`、既定1)
 
@@ -36,6 +39,7 @@ MythicMobs 5 はアイテムの `mythicmobs:type`(PDC)でMMアイテムを見分
 - 表示名は、名前が無い・文字は同じで色や装飾だけ崩れている・1.15.2の定義の名前のまま(定義側で改名された)のいずれかなら、現在のMM定義の名前に直します。金床などで別の名前に変えたものはそのままです。
 
 プレイヤー参加時・ワールド移動時・チェストなどを閉じた直後に、そのプレイヤーのインベントリとエンダーチェストを自動修復します(`repair-inventory-on-join` / `repair-inventory-on-world-change` / `repair-inventory-on-close`)。
+インベントリ内のStorageBoxは、箱の中身にも同じ修復を行います。
 旧定義との照合はチェスト、ワールド、他のプレイヤーには作用しません(チェストから取り出したアイテムは、閉じた時点で修復されます)。
 
 ## 3. `/mm i get` のアイテムと重なるようにする
@@ -86,7 +90,7 @@ excluded-mmids:
 
 ## 他プラグインから使うAPI
 
-`MythicItemFixer` の次の public メソッドを、リフレクションなどで呼び出せます(AziSync が使っています)。
+`MythicItemFixer` の次の public メソッドを、リフレクションなどで呼び出せます(AziSync と StorageBox が使っています)。
 
 | メソッド | スレッド | 内容 |
 |:--|:--|:--|
@@ -95,6 +99,7 @@ excluded-mmids:
 | `isMythicIdExcluded(String)` | 任意 | `excluded-mmids` に含まれるか |
 | `repairPlayerInventory(Player)` | メイン | 参加時と同じ自動修復(旧タグ変換+旧定義との照合)を今すぐ実行 |
 | `resolveMythicId(ItemStack)` | メイン | アイテムを変更せずにMMIDを調べる(mythicmobs:type → 旧タグ → 旧定義との照合)。StorageBoxが使用 |
+| `repairItem(ItemStack)` | メイン | 1つのアイテムに `/mmidfix inventory` と同じ修復を行ったコピーを返す(変更が無ければnull)。StorageBoxが中身に使用 |
 | `currentMythicItem(String)` | メイン | 今のMythicMobsが生成するそのIDのアイテム(1個) |
 
 他プラグインの独自データベースや独自ファイル内のアイテムは、そのプラグインが上のAPIを呼ばない限り対象外です。

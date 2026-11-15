@@ -18,6 +18,8 @@ class ItemConverter(
     private val convertedLogger: (String) -> Unit,
     private val errorLogger: (Throwable) -> Unit,
     private val exclusions: () -> MmidExclusions,
+    /** Repairs a Storage Box's content (outside inventories) and returns the rewritten box, or null. */
+    private val storageBoxRepair: ((ItemStack) -> ItemStack?)? = null,
 ) {
     val normalizer = StackNormalizer(bridge::currentItem)
     private var legacyNames: ((String) -> String?)? = null
@@ -61,12 +63,24 @@ class ItemConverter(
             if (!id.isNullOrEmpty() && !exclusions().isExcluded(id)) {
                 changes += normalize(item, id)
             }
+            changes += repairStorageBox(item)
             changes += convertNested(item, depth)
         } catch (exception: Exception) {
             errors++
             if (errors <= 10) errorLogger(exception)
         }
         return changes
+    }
+
+    /** Repairs the content of a Storage Box in place (see [MythicItemFixer.repairItem]). */
+    private fun repairStorageBox(item: ItemStack): Int {
+        val repair = storageBoxRepair ?: return 0
+        val repaired = repair(item) ?: return 0
+        val meta = repaired.itemMeta ?: return 0
+        if (repaired.type != item.type) return 0 // cannot replace the material in place
+        item.itemMeta = meta
+        item.amount = repaired.amount
+        return 1
     }
 
     /** Makes an item with an ID stack with `/mm i get` items (see [StackNormalizer]). */

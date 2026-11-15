@@ -41,6 +41,7 @@ class MythicItemFixer : JavaPlugin() {
     private var fullWorldScanner: FullWorldScanner? = null
     private var legacyMatcher: CurrentLegacyDefinitionMatcher? = null
     private var legacyMatcherError: String? = null
+    private var storageBoxBridge: StorageBoxBridge? = null
 
     @Volatile
     var exclusions: MmidExclusions = MmidExclusions.NONE
@@ -57,11 +58,22 @@ class MythicItemFixer : JavaPlugin() {
             return
         }
         val bridge = MythicItemBridge.detect()
+        val boxBridge = if (server.pluginManager.getPlugin("StorageBox") != null) {
+            try {
+                StorageBoxBridge(this).also { storageBoxBridge = it }
+            } catch (_: LinkageError) {
+                logger.warning("StorageBox was found but its API could not be loaded; box contents are not repaired.")
+                null
+            }
+        } else {
+            null
+        }
         val itemConverter = ItemConverter(
             bridge,
             { id -> if (config.getBoolean("log-converted-items", false)) logger.info("Preserved Mythic item ID: $id") },
             { error -> logger.log(Level.WARNING, "Could not inspect an item for a legacy Mythic ID", error) },
             { exclusions },
+            boxBridge?.let { api -> { item: ItemStack -> api.repair(item) } },
         )
         converter = itemConverter
         val compatListener = CompatibilityListener(this, itemConverter)
@@ -182,6 +194,20 @@ class MythicItemFixer : JavaPlugin() {
         val trimmed = id?.trim()
         if (trimmed.isNullOrEmpty() || exclusions.isExcluded(trimmed)) return null
         return trimmed
+    }
+
+    /**
+     * Repairs one item exactly like `/mmidfix inventory` does (old tag → ID, then the 1.15.2 definition match,
+     * Model, skin, attributes, name and the stack fix). Returns a repaired copy, or null when nothing changes.
+     * The item itself is not modified. For plugins that keep items outside inventories, such as StorageBox's
+     * contents. Main thread only.
+     */
+    fun repairItem(item: ItemStack?): ItemStack? {
+        val itemConverter = converter ?: return null
+        val matcher = legacyMatcher ?: return null
+        if (item == null || item.type.isAir || !item.hasItemMeta()) return null
+        val outcome = repairOne(item, matcher, itemConverter)
+        return (outcome as? RepairOutcome.Done)?.result?.takeIf { it.changed }?.item
     }
 
     /** A freshly generated item of the current MythicMobs definition (amount 1), or null if there is none. Main thread only. */
@@ -405,6 +431,7 @@ class MythicItemFixer : JavaPlugin() {
         var namesRepaired = 0
         var restacked = 0
         var skinlessGuesses = 0
+        var repairedBoxContents = 0
         var details = 0
         var hidden = 0
         val inventories = arrayOf(player.inventory, player.enderChest)
@@ -425,25 +452,16 @@ class MythicItemFixer : JavaPlugin() {
                 val item = inventory.getItem(slot) ?: continue
                 if (item.type.isAir || !item.hasItemMeta()) continue
                 inspected++
-                val meta = item.itemMeta ?: continue
-                var id = meta.persistentDataContainer.get(ItemConverter.TYPE, PersistentDataType.STRING)
-                val needsId = id == null || id.trim().isEmpty()
-                if (needsId) id = matcher.match(item) else alreadyTagged++
-                if (id == null) {
-                    noMatch++
-                    continue // ordinary items: counted, not listed
-                }
-                if (exclusions.isExcluded(id)) {
-                    excludedCount++
-                    continue // excluded MMIDs get no ID, Model or skin fixes
-                }
-                val current = itemConverter.bridge.currentItem(id)
-                if (current == null) {
-                    missingCurrent++
+                // A Storage Box keeps its content outside the inventory. Repair it with the same item
+                // repair, then write the box back (the box item itself is not a Mythic item).
+                val box = storageBoxBridge?.repair(item)
+                if (box != null) {
+                    if (!preview) inventory.setItem(slot, box)
+                    repairedBoxContents++
                     if (!automatic) {
                         if (details < DETAIL_LIMIT) {
                             player.sendMessage(
-                                "§e ✘ ${slotLabel(enderChest, slot)} §f${itemName(item)}§7：ID $id が今のMMにありません",
+                                "§a ✔ ${slotLabel(enderChest, slot)} §f${itemName(item)} §7→ §7中身を修復",
                             )
                             details++
                         } else {
@@ -452,88 +470,70 @@ class MythicItemFixer : JavaPlugin() {
                     }
                     continue
                 }
-                val legacyName = matcher.legacyNameFor(id)
-                var model: Int? = null
-                if (!meta.hasCustomModelData()) {
-                    val standard = current.itemMeta
-                    if (standard != null && standard.hasCustomModelData()) model = standard.customModelData
-                    if (model == null) model = matcher.modelFor(id)
-                }
-                val missingSkin = CurrentLegacyDefinitionMatcher.isSkinlessHead(item)
-                val inferredWithoutSkin = needsId && missingSkin
-                if (inferredWithoutSkin) skinlessGuesses++
-                val canRestoreSkin = missingSkin && current.type == Material.PLAYER_HEAD &&
-                    (
-                        current.itemMeta is SkullMeta &&
-                            !CurrentLegacyDefinitionMatcher.isSkinlessHead(current) ||
-                            matcher.headSkinFor(id) != null
-                        )
-                val missingAttributes = missingAttributes(meta, current)
-                val restoreAttributes = !missingAttributes.isEmpty
-                val wantedName = nameToRestore(meta, current, legacyName)
-                val restoreName = wantedName != null
-                val fixed = item.clone()
-                val fixedMeta = fixed.itemMeta ?: continue
-                var skinRestored = false
-                if (needsId) fixedMeta.persistentDataContainer.set(ItemConverter.TYPE, PersistentDataType.STRING, id)
-                if (model != null) fixedMeta.setCustomModelData(model)
-                if (canRestoreSkin) {
-                    skinRestored = restoreHeadProfile(
-                        fixedMeta as SkullMeta,
-                        current,
-                        matcher.headSkinFor(id),
-                        id,
-                    )
-                }
-                if (restoreAttributes) restoreAttributes(fixedMeta, missingAttributes)
-                if (wantedName != null) fixedMeta.displayName(wantedName)
-                fixed.itemMeta = fixedMeta
-                val stackable = itemConverter.normalizer.normalize(fixed, id, legacyName)
-                val restack = stackable != null
-                if (!needsId && model == null && !canRestoreSkin && !restoreAttributes && !restoreName && !restack) {
-                    continue
-                }
-                if (!automatic) {
-                    if (details < DETAIL_LIMIT) {
-                        val fixes = ArrayList<String>()
-                        if (needsId) fixes.add("MMID §a$id")
-                        if (model != null) fixes.add("§7Model §a$model")
-                        if (canRestoreSkin) fixes.add("§7スキン §a復元")
-                        if (restoreAttributes) fixes.add("§7属性 §a${missingAttributes.size()}件")
-                        if (wantedName != null) fixes.add("§7名前 §a${plain(wantedName)}")
-                        if (restack) {
-                            fixes.add("§7スタック §a${stackableParts(fixed, stackable!!)}")
+                when (val outcome = repairOne(item, matcher, itemConverter)) {
+                    RepairOutcome.NotMythic -> noMatch++ // ordinary items: counted, not listed
+                    is RepairOutcome.Excluded -> excludedCount++ // excluded MMIDs get no ID, Model or skin fixes
+                    is RepairOutcome.MissingCurrent -> {
+                        missingCurrent++
+                        if (!automatic) {
+                            if (details < DETAIL_LIMIT) {
+                                player.sendMessage(
+                                    "§e ✘ ${slotLabel(enderChest, slot)} §f${itemName(item)}§7：ID ${outcome.id} が今のMMにありません",
+                                )
+                                details++
+                            } else {
+                                hidden++
+                            }
                         }
-                        player.sendMessage(
-                            "§a ✔ ${slotLabel(enderChest, slot)} §f${itemName(item)} §7→ " +
-                                fixes.joinToString("§7、") +
-                                if (inferredWithoutSkin) " §e（スキン無し・名前とLoreで推定）" else "",
-                        )
-                        details++
-                    } else {
-                        hidden++
+                    }
+                    is RepairOutcome.Done -> {
+                        val result = outcome.result
+                        if (result.wasTagged) alreadyTagged++
+                        if (result.inferredWithoutSkin) skinlessGuesses++
+                        if (!result.changed) continue
+                        if (!automatic) {
+                            if (details < DETAIL_LIMIT) {
+                                val fixes = ArrayList<String>()
+                                if (result.needsId) fixes.add("MMID §a${result.id}")
+                                if (result.model != null) fixes.add("§7Model §a${result.model}")
+                                if (result.skinRestored) fixes.add("§7スキン §a復元")
+                                if (result.attributesRestored > 0) {
+                                    fixes.add("§7属性 §a${result.attributesRestored}件")
+                                }
+                                if (result.nameRestored) fixes.add("§7名前 §a${plain(result.fixed.displayName()!!)}")
+                                if (result.restacked) {
+                                    fixes.add("§7スタック §a${stackableParts(result.fixed, result.item)}")
+                                }
+                                player.sendMessage(
+                                    "§a ✔ ${slotLabel(enderChest, slot)} §f${itemName(item)} §7→ " +
+                                        fixes.joinToString("§7、") +
+                                        if (result.inferredWithoutSkin) " §e（スキン無し・名前とLoreで推定）" else "",
+                                )
+                                details++
+                            } else {
+                                hidden++
+                            }
+                        }
+                        if (!preview) inventory.setItem(slot, result.item)
+                        if (result.needsId) idsRepaired++
+                        if (result.model != null) modelsRepaired++
+                        if (result.skinRestored) skinsRepaired++
+                        if (result.attributesRestored > 0) attributesRepaired++
+                        if (result.nameRestored) namesRepaired++
+                        if (result.restacked) restacked++
                     }
                 }
-                if (!preview) {
-                    if (skinRestored) skinsRepaired++
-                    inventory.setItem(slot, if (restack) stackable!! else fixed)
-                }
-                if (needsId) idsRepaired++
-                if (model != null) modelsRepaired++
-                if (preview && canRestoreSkin) skinsRepaired++
-                if (restoreAttributes) attributesRepaired++
-                if (restoreName) namesRepaired++
-                if (restack) restacked++
             }
         }
-        val repaired = idsRepaired + modelsRepaired + skinsRepaired + attributesRepaired + namesRepaired + restacked
+        val repaired = idsRepaired + modelsRepaired + skinsRepaired + attributesRepaired + namesRepaired +
+            restacked + repairedBoxContents
         if (automatic) {
             if (repaired > 0) {
                 send(
                     player,
                     "§aインベントリを自動修復しました §7（MMID $idsRepaired・Model $modelsRepaired" +
                         "・スキン $skinsRepaired・属性 $attributesRepaired・名前 $namesRepaired" +
-                        "・スタック $restacked）",
+                        "・スタック $restacked・Storage Box $repairedBoxContents）",
                 )
             }
             return
@@ -542,7 +542,7 @@ class MythicItemFixer : JavaPlugin() {
         player.sendMessage(
             "§f結果：" + (if (preview) "修復できるもの" else "修復したもの") + " §aMMID $idsRepaired" +
                 "§7・§aModel $modelsRepaired§7・§aスキン $skinsRepaired§7・§a属性 $attributesRepaired" +
-                "§7・§a名前 $namesRepaired§7・§aスタック $restacked",
+                "§7・§a名前 $namesRepaired§7・§aスタック $restacked§7・§aStorage Box $repairedBoxContents",
         )
         player.sendMessage(
             "§7確認 ${inspected}個（MMID付与済み $alreadyTagged・MMアイテムではない/一致なし " +
@@ -565,6 +565,99 @@ class MythicItemFixer : JavaPlugin() {
         } else if (preview) {
             player.sendMessage("§7実行するには §e/mmidfix inventory")
         }
+    }
+
+    /**
+     * The shared repair step: old tag → ID, then the 1.15.2 definition match, Model, skin, attributes,
+     * name and the stack fix. [item] is not modified; the repaired copy is in [RepairOutcome.Done].
+     */
+    private fun repairOne(
+        item: ItemStack,
+        matcher: CurrentLegacyDefinitionMatcher,
+        itemConverter: ItemConverter,
+    ): RepairOutcome {
+        val meta = item.itemMeta ?: return RepairOutcome.NotMythic
+        var id = meta.persistentDataContainer.get(ItemConverter.TYPE, PersistentDataType.STRING)
+        val needsId = id == null || id.trim().isEmpty()
+        if (needsId) id = matcher.match(item)
+        if (id == null) return RepairOutcome.NotMythic
+        if (exclusions.isExcluded(id)) return RepairOutcome.Excluded(id)
+        val current = itemConverter.bridge.currentItem(id) ?: return RepairOutcome.MissingCurrent(id)
+        val legacyName = matcher.legacyNameFor(id)
+        var model: Int? = null
+        if (!meta.hasCustomModelData()) {
+            val standard = current.itemMeta
+            if (standard != null && standard.hasCustomModelData()) model = standard.customModelData
+            if (model == null) model = matcher.modelFor(id)
+        }
+        val missingSkin = CurrentLegacyDefinitionMatcher.isSkinlessHead(item)
+        val inferredWithoutSkin = needsId && missingSkin
+        val canRestoreSkin = missingSkin && current.type == Material.PLAYER_HEAD &&
+            (
+                current.itemMeta is SkullMeta &&
+                    !CurrentLegacyDefinitionMatcher.isSkinlessHead(current) ||
+                    matcher.headSkinFor(id) != null
+                )
+        val missingAttributes = missingAttributes(meta, current)
+        val restoreAttributes = !missingAttributes.isEmpty
+        val wantedName = nameToRestore(meta, current, legacyName)
+        val fixed = item.clone()
+        val fixedMeta = fixed.itemMeta ?: return RepairOutcome.NotMythic
+        var skinRestored = false
+        if (needsId) fixedMeta.persistentDataContainer.set(ItemConverter.TYPE, PersistentDataType.STRING, id)
+        if (model != null) fixedMeta.setCustomModelData(model)
+        if (canRestoreSkin) {
+            skinRestored = restoreHeadProfile(
+                fixedMeta as SkullMeta,
+                current,
+                matcher.headSkinFor(id),
+                id,
+            )
+        }
+        if (restoreAttributes) restoreAttributes(fixedMeta, missingAttributes)
+        if (wantedName != null) fixedMeta.displayName(wantedName)
+        fixed.itemMeta = fixedMeta
+        val stackable = itemConverter.normalizer.normalize(fixed, id, legacyName)
+        val restack = stackable != null
+        return RepairOutcome.Done(
+            RepairResult(
+                id = id,
+                item = if (restack) stackable!! else fixed,
+                fixed = fixed,
+                needsId = needsId,
+                wasTagged = !needsId,
+                model = model,
+                skinRestored = skinRestored,
+                attributesRestored = missingAttributes.size(),
+                nameRestored = wantedName != null,
+                restacked = restack,
+                inferredWithoutSkin = inferredWithoutSkin,
+            ),
+        )
+    }
+
+    private sealed interface RepairOutcome {
+        object NotMythic : RepairOutcome
+        data class Excluded(val id: String) : RepairOutcome
+        data class MissingCurrent(val id: String) : RepairOutcome
+        data class Done(val result: RepairResult) : RepairOutcome
+    }
+
+    private class RepairResult(
+        val id: String,
+        val item: ItemStack,
+        val fixed: ItemStack,
+        val needsId: Boolean,
+        val wasTagged: Boolean,
+        val model: Int?,
+        val skinRestored: Boolean,
+        val attributesRestored: Int,
+        val nameRestored: Boolean,
+        val restacked: Boolean,
+        val inferredWithoutSkin: Boolean,
+    ) {
+        val changed: Boolean
+            get() = needsId || model != null || skinRestored || attributesRestored > 0 || nameRestored || restacked
     }
 
     private fun reloadExclusions() {
