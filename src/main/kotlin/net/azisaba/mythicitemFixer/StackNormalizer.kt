@@ -4,6 +4,7 @@ import com.google.gson.JsonElement
 import io.papermc.paper.datacomponent.DataComponentType
 import io.papermc.paper.datacomponent.DataComponentTypes
 import io.papermc.paper.datacomponent.item.ItemLore
+import io.papermc.paper.datacomponent.item.ResolvableProfile
 import io.papermc.paper.persistence.PersistentDataContainerView
 import net.kyori.adventure.text.Component
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
@@ -29,7 +30,9 @@ import java.util.Optional
  * - `custom_data`: when it holds nothing but Bukkit PDC, MythicMobs 4 leftovers (`MYTHIC_*`,
  *   `Prevent*`) and keys the current item has too. PDC entries of other plugins are carried over.
  *
- * Every other component (enchantments, damage, attributes, model, skin, ...) stays the item's own.
+ * `profile` (player heads) is taken only when the skin textures are identical and just the profile
+ * UUID/name differs. Every other component (enchantments, damage, attributes, model, ...) stays the
+ * item's own.
  * Definitions that generate a different item each time (random stats) are never used.
  */
 class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
@@ -65,6 +68,8 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
             for (type in template.dataTypes) {
                 if (key(type) !in OWN_COMPONENTS && !item.hasData(type)) result.unsetData(type)
             }
+            // Same skin under a different profile UUID/name (heads generated at different times)
+            if (sameSkin(item, template)) copy(template, result, DataComponentTypes.PROFILE)
             if (!nameReplaceable(item, template, legacyName)) copy(item, result, DataComponentTypes.CUSTOM_NAME)
             carryPersistentData(item, template, result)
             result.amount = item.amount
@@ -87,9 +92,26 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
     private fun generate(id: String): ItemStack? {
         val first = currentItem(id) ?: return null
         val second = currentItem(id) ?: return null
-        if (first.type.isAir || !first.isSimilar(second)) return null // random definition: a swap would reroll it
+        if (first.type.isAir) return null
+        if (!first.isSimilar(second)) {
+            // A head whose profile UUID is generated per item is still one definition when the skin
+            // is the same; anything else differing is a random definition and a swap would reroll it.
+            if (!sameSkin(first, second)) return null
+            val aligned = second.clone()
+            copy(first, aligned, DataComponentTypes.PROFILE)
+            if (!first.isSimilar(aligned)) return null
+        }
         return first.clone().apply { amount = 1 }
     }
+
+    /** True when both items are heads with the same texture properties (UUID and name may differ). */
+    private fun sameSkin(a: ItemStack, b: ItemStack): Boolean {
+        val skin = skin(a.getData(DataComponentTypes.PROFILE) ?: return false)
+        return skin.isNotEmpty() && skin == skin(b.getData(DataComponentTypes.PROFILE) ?: return false)
+    }
+
+    private fun skin(profile: ResolvableProfile): Set<Pair<String, String>> =
+        profile.properties().mapTo(HashSet()) { it.name to it.value }
 
     private fun key(type: DataComponentType): String = type.key.toString()
 
