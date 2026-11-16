@@ -39,6 +39,7 @@ class CurrentLegacyDefinitionMatcher private constructor() {
     private val traitsById = HashMap<String, Traits>()
     private val headSkinsById = HashMap<String, String>()
     private val legacyNamesById = HashMap<String, String>()
+    private val legacyLoresById = HashMap<String, List<String>>()
     private val ambiguous = HashSet<Signature>()
     /** Plain signatures of what the current MythicMobs generates (`/mm i get`), the fallback. */
     private val currentIds = HashMap<Signature, String>()
@@ -76,6 +77,9 @@ class CurrentLegacyDefinitionMatcher private constructor() {
     /** The `Display` of the 1.15.2 definition (colour codes applied), or null if it had none. */
     fun legacyNameFor(id: String): String? = legacyNamesById[id]
 
+    /** The `Lore` of the 1.15.2 definition (colour codes applied), or null if it had none. */
+    fun legacyLoreFor(id: String): List<String>? = legacyLoresById[id]
+
     fun summary(): String =
         "読込ファイル ${files}件（構文エラー ${invalidFiles}件）、一意な旧定義 ${ids.size}件、" +
             "現行定義 ${currentIds.size}件（重複 ${currentAmbiguous.size}件）、" +
@@ -92,6 +96,8 @@ class CurrentLegacyDefinitionMatcher private constructor() {
         traitsById[id] = Traits.fromDefinition(config, current)
         val legacyName = Signature.colored(config["Display"])
         if (legacyName != null) legacyNamesById[id] = legacyName
+        val legacyLore = (config["Lore"] as? List<*>)?.mapNotNull { Signature.colored(it) }
+        if (!legacyLore.isNullOrEmpty()) legacyLoresById[id] = legacyLore
         val signature = Signature.fromDefinition(config, current.type) ?: return
         if (signature.skinUrl != null) headSkinsById[id] = signature.skinUrl
 

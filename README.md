@@ -44,19 +44,18 @@ MythicMobs 5 はアイテムの `mythicmobs:type`(PDC)でMMアイテムを見分
 
 ## 3. `/mm i get` のアイテムと重なるようにする
 
-1.15.2 から移行したアイテムは、今のMMが生成するアイテムと次の3点だけ違うことが多く、そのせいでスタックできません。
-
-- `custom_name`:文字は同じでも、色や `italic:false` が無い
-- `lore`:同上
-- `custom_data`:MythicMobs 5 が付ける `mythicmobs:prevent_*` や `display:{}` が無い
-
-MMIDが分かったアイテム(`mythicmobs:type` 付き、または 2. で特定できたもの)で、次の条件を満たすときだけ、この3つを今のMMの生成物に揃えます。
-それ以外の部分(エンチャント、耐久値、属性、Model、スキンなど)はアイテム自身のままです。
+1.15.2 から移行したアイテムは、中身は同じでも書き方が今のMMの生成物と違うため、スタックできないことがあります。
+MMIDが分かったアイテム(`mythicmobs:type` 付き、または 2. で特定できたもの)は、次の部分を今のMMの生成物に揃えます。
 
 - 名前:名前が無い・文字が同じ・1.15.2の定義の名前のまま、のどれか。金床で付けた名前はそのまま残します
-- Lore:全行の文字が完全に同じ(色・装飾だけの違い)。Lv1/Lv2や個別ステータスなど文字が違うLoreはそのまま残し、そのアイテムはスタック用の整形自体を行いません
-- custom_data:PDC、MythicMobs 4 の名残(`MYTHIC_*`・`Prevent*`)、今のMMのアイテムにもあるキーしか無い。他プラグインのPDCは引き継ぎます
+- Lore:全行の文字が今の定義か1.15.2の定義と同じ。Lv1/Lv2や個別ステータスなど文字が違うLoreはそのまま残し、そのアイテムは整形自体を行いません
+- custom_data:PDC、MythicMobs 4 の名残(`MYTHIC_*`・`Prevent*`)、1.15.2の古いタグ(`HideFlags`など)、今のMMのアイテムにもあるキーしか無い。他プラグインのPDCは引き継ぎます
+- ヘッドのスキン(`profile`):テクスチャが同じでUUIDだけ違う
+- スタックできるアイテム(最大スタック数2以上)のみ:定義だけが決める部分(表示設定 `tooltip_display`、Model、属性、耐久無限、エンチャントの光など)
 - 生成するたびに内容が変わる(ランダム要素のある)定義は対象外
+
+エンチャント・耐久値・金床の使用歴・装飾など、プレイヤーが個別に変えられる部分はアイテム自身のままです。
+揃えても重ならないアイテムは `/mmidfix check` に「重なりません」と理由付きで出ます。手に持って `/mmidfix hand` で、今の定義と違う部分を値付きで確認できます。
 
 インベントリ修復(2.)に加え、1. の走査(チェスト、開いたインベントリ、ドロップなど)でも `mythicmobs:type` 付きのアイテムに行います。
 MMの定義を変えたら `/mmidfix reload` してください(生成物をキャッシュしています)。
@@ -71,17 +70,22 @@ excluded-mmids:
   - Event_*    # Event_ で始まるMMIDすべて
 ```
 
+また、今のMMの定義がただのバニラアイテム(MM自身の `mythicmobs:*` タグ以外に何も付かない)のMMIDも、自動で除外扱いになります(`exclude-vanilla-definitions`、既定 `true`)。
+1.15.2で普通のアイテムだったものにMMIDを付けて、バニラのアイテムと重ならなくしてしまうのを防ぐためです。
+さらに、そのMMIDが付いていてもMMのタグ以外はバニラと同じアイテムは、タグを外して普通のバニラアイテムに戻します(自動修復・走査・`/mmidfix`・Storage Boxの中身・`repairItem` API)。
+SearchableInfiniteShop の取引も同じ規則で、該当するMMIDの取引はバニラアイテムとして扱います(次回の保存でファイルにも反映)。件数は `/mmidfix status` に出ます。
+
 変更後は `/mmidfix reload` で反映されます。
 
 ## コマンド
 
-`help`・`hand`・`inventory` は権限 `mythicitemfixer.use`(既定で全員)、それ以外は `mythicitemfixer.admin`(既定OP)が必要です。
+`/mmidfix`・`check`・`hand`・`help` は権限 `mythicitemfixer.use`(既定で全員)、それ以外は `mythicitemfixer.admin`(既定OP)が必要です。
 
 | コマンド | 権限 | 内容 |
 |:--|:--|:--|
-| `/mmidfix hand` | use | 手持ちアイテムの旧タグを変換してIDを表示 |
-| `/mmidfix inventory preview` | use | 自分のインベントリとエンダーチェストの修復候補を表示(変更しない) |
-| `/mmidfix inventory` | use | 自分のインベントリとエンダーチェストを修復 |
+| `/mmidfix` | use | 自分のインベントリとエンダーチェストを修復(シュルカー・バンドル・Storage Boxの中身も) |
+| `/mmidfix check` | use | 何が修復されるか・重ならないアイテムとその理由を表示(変更しない) |
+| `/mmidfix hand` | use | 手持ちのアイテムを修復し、`/mm i get` と違う部分を値付きで表示 |
 | `/mmidfix status` | admin | 処理件数と旧定義の読込状況 |
 | `/mmidfix reload` | admin | 設定と旧定義を読み直す(MMのアイテムを変更・リロードした後に) |
 | `/mmidfix scan` | admin | オンラインプレイヤーと読込済みチャンクを走査 |
@@ -99,7 +103,7 @@ excluded-mmids:
 | `isMythicIdExcluded(String)` | 任意 | `excluded-mmids` に含まれるか |
 | `repairPlayerInventory(Player)` | メイン | 参加時と同じ自動修復(旧タグ変換+旧定義との照合)を今すぐ実行 |
 | `resolveMythicId(ItemStack)` | メイン | アイテムを変更せずにMMIDを調べる(mythicmobs:type → 旧タグ → 旧定義との照合)。StorageBoxが使用 |
-| `repairItem(ItemStack)` | メイン | 1つのアイテムに `/mmidfix inventory` と同じ修復を行ったコピーを返す(変更が無ければnull)。StorageBoxが中身に使用 |
+| `repairItem(ItemStack)` | メイン | 1つのアイテムに `/mmidfix` と同じ修復を行ったコピーを返す(変更が無ければnull)。StorageBoxが中身に使用 |
 | `currentMythicItem(String)` | メイン | 今のMythicMobsが生成するそのIDのアイテム(1個) |
 
 他プラグインの独自データベースや独自ファイル内のアイテムは、そのプラグインが上のAPIを呼ばない限り対象外です。

@@ -2,6 +2,7 @@ package net.azisaba.mythicitemFixer
 
 import com.google.common.collect.LinkedHashMultimap
 import com.google.common.collect.Multimap
+import io.papermc.paper.datacomponent.DataComponentTypes
 import net.kyori.adventure.text.Component
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
 import org.bukkit.Bukkit
@@ -10,10 +11,13 @@ import org.bukkit.Chunk
 import org.bukkit.Material
 import org.bukkit.attribute.Attribute
 import org.bukkit.attribute.AttributeModifier
+import org.bukkit.block.Container
 import org.bukkit.command.Command
 import org.bukkit.command.CommandSender
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemStack
+import org.bukkit.inventory.meta.BlockStateMeta
+import org.bukkit.inventory.meta.BundleMeta
 import org.bukkit.inventory.meta.ItemMeta
 import org.bukkit.inventory.meta.SkullMeta
 import org.bukkit.persistence.PersistentDataType
@@ -51,7 +55,6 @@ class MythicItemFixer : JavaPlugin() {
 
     override fun onEnable() {
         saveDefaultConfig()
-        reloadExclusions()
         if (server.pluginManager.getPlugin("MythicMobs") == null) {
             logger.severe("MythicMobs is not installed; disabling.")
             server.pluginManager.disablePlugin(this)
@@ -76,6 +79,9 @@ class MythicItemFixer : JavaPlugin() {
             boxBridge?.let { api -> { item: ItemStack -> api.repair(item) } },
         )
         converter = itemConverter
+        reloadExclusions()
+        // MythicMobs may finish loading its items after this plugin is enabled: look again next tick
+        Bukkit.getScheduler().runTask(this, Runnable { reloadExclusions() })
         val compatListener = CompatibilityListener(this, itemConverter)
         listener = compatListener
         offlineMigrator = OfflinePlayerDataMigrator(this)
@@ -207,6 +213,7 @@ class MythicItemFixer : JavaPlugin() {
         val matcher = legacyMatcher ?: return null
         if (item == null || item.type.isAir || !item.hasItemMeta()) return null
         val outcome = repairOne(item, matcher, itemConverter)
+        if (outcome is RepairOutcome.Reverted) return outcome.item
         return (outcome as? RepairOutcome.Done)?.result?.takeIf { it.changed }?.item
     }
 
@@ -253,79 +260,22 @@ class MythicItemFixer : JavaPlugin() {
         label: String,
         args: Array<out String>,
     ): Boolean {
-        val admin = sender.hasPermission(PERM_ADMIN)
-        val sub = if (args.isEmpty()) {
-            if (admin) "status" else "help"
-        } else {
-            args[0].lowercase(Locale.ROOT)
+        val sub = when (val first = args.firstOrNull()?.lowercase(Locale.ROOT)) {
+            null, "fix" -> "fix"
+            // old spellings
+            "inventory", "inv" -> if (args.getOrNull(1).equals("preview", ignoreCase = true)) "check" else "fix"
+            "preview" -> "check"
+            else -> first
         }
-        if (if (sub in ADMIN_SUBCOMMANDS) !admin else !sender.hasPermission(PERM_USE)) {
+        if (if (sub in ADMIN_SUBCOMMANDS) !sender.hasPermission(PERM_ADMIN) else !sender.hasPermission(PERM_USE)) {
             send(sender, "§cこのコマンドを実行する権限がありません。")
             return true
         }
         when (sub) {
-            "status" -> {
-                val itemConverter = converter ?: return true
-                send(sender, "§f動作状況")
-                sender.sendMessage(
-                    "§7・旧タグの変換：確認 §f${itemConverter.getChecked()}§7個 / ID付与 §a" +
-                        "${itemConverter.getConverted()}§7個 / 除外 §f${itemConverter.getExcluded()}§7個 / エラー " +
-                        errorCount(itemConverter.getErrors()) + " §7/ スタック用に整形 §a" +
-                        "${itemConverter.getNormalized()}§7個",
-                )
-                sender.sendMessage("§7・除外MMID：§f" + exclusions.summary())
-                val matcher = legacyMatcher
-                sender.sendMessage(
-                    "§7・旧定義：" + if (matcher != null) {
-                        "§f" + matcher.summary()
-                    } else {
-                        "§c読み込めていません（$legacyMatcherError）"
-                    },
-                )
-                if (isOfflineMigrationRunning()) sender.sendMessage("§7・オフラインプレイヤーの変換：§e実行中")
-                if (isFullWorldScanRunning()) {
-                    sender.sendMessage("§7・" + (fullWorldScanner?.status("ワールド全体の走査：§e実行中§7") ?: ""))
-                }
-                sender.sendMessage("§7コマンド一覧は §e/mmidfix help")
-            }
-            "hand" -> {
-                val player = sender as? Player ?: run {
-                    send(sender, "§eプレイヤーとして実行してください。")
-                    return true
-                }
-                val itemConverter = converter ?: return true
-                val item = player.inventory.itemInMainHand
-                if (item.type.isAir) {
-                    send(sender, "§e手に何も持っていません。")
-                    return true
-                }
-                val converted = itemConverter.convert(item)
-                player.inventory.setItemInMainHand(item)
-                val id = if (item.hasItemMeta()) {
-                    item.itemMeta?.persistentDataContainer?.get(ItemConverter.TYPE, PersistentDataType.STRING)
-                } else {
-                    null
-                }
-                if (id == null) {
-                    send(
-                        sender,
-                        "§f${itemName(item)}§7：MMIDはありません。§7旧定義との照合は §e/mmidfix inventory preview",
-                    )
-                } else {
-                    send(
-                        sender,
-                        "§f${itemName(item)}§7：MMID §a$id" +
-                            if (converted > 0) " §a（旧タグから付与しました）" else " §7（付与済み）",
-                    )
-                }
-            }
-            "inventory" -> {
-                val player = sender as? Player ?: run {
-                    send(sender, "§eプレイヤーとして実行してください。")
-                    return true
-                }
-                repairInventory(player, args.size > 1 && args[1].equals("preview", ignoreCase = true), false)
-            }
+            "fix" -> asPlayer(sender)?.let { repairInventory(it, preview = false, automatic = false) }
+            "check" -> asPlayer(sender)?.let { repairInventory(it, preview = true, automatic = false) }
+            "hand" -> asPlayer(sender)?.let(::inspectHand)
+            "status" -> status(sender)
             "reload" -> {
                 reloadConfig()
                 reloadExclusions()
@@ -376,18 +326,42 @@ class MythicItemFixer : JavaPlugin() {
         alias: String,
         args: Array<out String>,
     ): List<String> {
-        if (args.size == 1) {
-            val options = ArrayList<String>()
-            if (sender.hasPermission(PERM_USE)) options.addAll(PLAYER_SUBCOMMANDS)
-            if (sender.hasPermission(PERM_ADMIN)) options.addAll(ADMIN_SUBCOMMANDS)
-            return matching(options, args[0])
+        if (args.size != 1) return emptyList()
+        val options = ArrayList<String>()
+        if (sender.hasPermission(PERM_USE)) options.addAll(PLAYER_SUBCOMMANDS)
+        if (sender.hasPermission(PERM_ADMIN)) options.addAll(ADMIN_SUBCOMMANDS)
+        return matching(options, args[0])
+    }
+
+    private fun asPlayer(sender: CommandSender): Player? {
+        if (sender is Player) return sender
+        send(sender, "§eプレイヤーとして実行してください。")
+        return null
+    }
+
+    private fun status(sender: CommandSender) {
+        val itemConverter = converter ?: return
+        send(sender, "§f動作状況")
+        sender.sendMessage(
+            "§7・自動処理：確認 §f${itemConverter.getChecked()}§7個 / 旧タグからID付与 §a" +
+                "${itemConverter.getConverted()}§7個 / 重なるよう整形 §a${itemConverter.getNormalized()}§7個 / " +
+                "バニラに戻す §a${itemConverter.getReverted()}§7個 / " +
+                "除外 §f${itemConverter.getExcluded()}§7個 / エラー " + errorCount(itemConverter.getErrors()),
+        )
+        sender.sendMessage("§7・除外MMID：§f" + exclusions.summary())
+        val matcher = legacyMatcher
+        sender.sendMessage(
+            "§7・旧定義：" + if (matcher != null) {
+                "§f" + matcher.summary()
+            } else {
+                "§c読み込めていません（$legacyMatcherError）"
+            },
+        )
+        if (isOfflineMigrationRunning()) sender.sendMessage("§7・オフラインプレイヤーの変換：§e実行中")
+        if (isFullWorldScanRunning()) {
+            sender.sendMessage("§7・" + (fullWorldScanner?.status("ワールド全体の走査：§e実行中§7") ?: ""))
         }
-        if (args.size == 2 && args[0].equals("inventory", ignoreCase = true) &&
-            sender.hasPermission(PERM_USE)
-        ) {
-            return matching(listOf("preview"), args[1])
-        }
-        return emptyList()
+        sender.sendMessage("§7コマンド一覧は §e/mmidfix help")
     }
 
     private fun startOfflineScan(sender: CommandSender) {
@@ -406,165 +380,297 @@ class MythicItemFixer : JavaPlugin() {
         )
     }
 
-    private fun repairInventory(player: Player, preview: Boolean, automatic: Boolean) {
-        val matcher = legacyMatcher
-        if (matcher == null) {
-            if (!automatic) {
-                send(player, "§c旧MythicMobsのItemsを読み込めませんでした。")
-                player.sendMessage(
-                    "§7plugins/MythicItemFixer/legacy-mythic-items/ に、1.15.2のItemsの中身を入れて §e/mmidfix reload",
+    private fun legacyMissing(player: Player) {
+        send(player, "§c旧MythicMobsのItemsを読み込めていないため修復できません。")
+        player.sendMessage("§7plugins/MythicItemFixer/legacy-mythic-items/ に1.15.2のItemsの中身を入れて §e/mmidfix reload")
+        player.sendMessage("§7詳細：$legacyMatcherError")
+    }
+
+    /** `/mmidfix hand`: repairs the held item and explains everything that still differs from `/mm i get`. */
+    private fun inspectHand(player: Player) {
+        val matcher = legacyMatcher ?: return legacyMissing(player)
+        val itemConverter = converter ?: return
+        val item = player.inventory.itemInMainHand
+        if (item.type.isAir) {
+            send(player, "§e手に何も持っていません。")
+            return
+        }
+        val name = itemName(item)
+        val box = storageBoxBridge?.repair(item)
+        if (box != null) {
+            player.inventory.setItemInMainHand(box)
+            send(player, "§f$name§7：§aStorage Boxの中身を修復しました。")
+            return
+        }
+        val contents = repairContents(item, matcher, itemConverter, 0)
+        if (contents != null) {
+            player.inventory.setItemInMainHand(contents.item)
+            send(player, "§f$name§7：§a中のアイテム ${contents.count}個を修復しました。")
+            return
+        }
+        when (val outcome = repairOne(item, matcher, itemConverter)) {
+            RepairOutcome.NotMythic -> send(
+                player,
+                "§f$name§7：MMIDが無く、旧定義・今の定義のどれとも一致しないためMMアイテムと判断できません。",
+            )
+            is RepairOutcome.Excluded -> send(
+                player,
+                "§f$name§7：MMID §f${outcome.id}§7 は" + if (exclusions.isVanillaDefinition(outcome.id)) {
+                    "今のMMの定義がただのバニラアイテムなので、置き換えません。"
+                } else {
+                    "除外設定されています。"
+                },
+            )
+            is RepairOutcome.Reverted -> {
+                player.inventory.setItemInMainHand(outcome.item)
+                send(
+                    player,
+                    "§f$name§7：MMID §f${outcome.id}§7 の今の定義はただのバニラアイテムなので、" +
+                        "§aMMのタグを外して普通のアイテムに戻しました。",
                 )
-                player.sendMessage("§7詳細：$legacyMatcherError")
             }
+            is RepairOutcome.MissingCurrent -> send(
+                player,
+                "§f$name§7：MMID §f${outcome.id}§7 は今のMMに無いため修復できません。",
+            )
+            is RepairOutcome.Done -> {
+                val result = outcome.result
+                if (result.changed) player.inventory.setItemInMainHand(result.item)
+                send(player, "§f$name §7（MMID §a${result.id}§7）")
+                player.sendMessage(
+                    if (result.changed) "§a ✔ 修復：" + fixSummary(result) else "§7 ・修復が必要な箇所はありませんでした",
+                )
+                when {
+                    !result.canStack -> player.sendMessage("§7 ・重ならない種類のアイテムです")
+                    result.stacks -> player.sendMessage("§a ✔ /mm i get のアイテムと重なります")
+                    else -> {
+                        player.sendMessage("§e △ /mm i get のアイテムと重なりません")
+                        for (reason in result.stackReasons) player.sendMessage("§7   ・$reason")
+                        val template = itemConverter.normalizer.template(result.id)
+                        if (template != null) showComponentDiff(player, result.item, template)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Prints each differing component with both values, shortened, for finding why two items differ. */
+    private fun showComponentDiff(player: Player, item: ItemStack, template: ItemStack) {
+        val mine = StackNormalizer.components(item)
+        val wanted = StackNormalizer.components(template)
+        val keys = StackNormalizer.differingComponents(item, template)
+        if (keys.isEmpty()) return
+        player.sendMessage("§7 違う部分（§f手持ち §7/ §b今の定義§7）：")
+        for (key in keys.take(8)) {
+            player.sendMessage("§7  ${StackNormalizer.label(key)} §8($key)")
+            player.sendMessage("§f    " + shorten(mine[key]?.toString() ?: "なし"))
+            player.sendMessage("§b    " + shorten(wanted[key]?.toString() ?: "なし"))
+        }
+        if (keys.size > 8) player.sendMessage("§7  …ほか ${keys.size - 8}件")
+    }
+
+    private class Report(private val player: Player, private val show: Boolean) {
+        var inspected = 0
+        var repaired = 0
+        var notStacking = 0
+        var missingCurrent = 0
+        var skinlessGuesses = 0
+        private var lines = 0
+        private var hidden = 0
+
+        fun line(text: String) {
+            if (!show) return
+            if (lines < DETAIL_LIMIT) {
+                player.sendMessage(text)
+                lines++
+            } else {
+                hidden++
+            }
+        }
+
+        fun finishLines() {
+            if (hidden > 0) player.sendMessage("§7 …ほか ${hidden}件")
+        }
+    }
+
+    /**
+     * Repairs (or with [preview] only reports) every item in the inventory and ender chest, including
+     * shulker box / bundle / Storage Box contents.
+     */
+    private fun repairInventory(player: Player, preview: Boolean, automatic: Boolean) {
+        val matcher = legacyMatcher ?: run {
+            if (!automatic) legacyMissing(player)
             return
         }
         val itemConverter = converter ?: return
-        var inspected = 0
-        var alreadyTagged = 0
-        var noMatch = 0
-        var missingCurrent = 0
-        var excludedCount = 0
-        var idsRepaired = 0
-        var modelsRepaired = 0
-        var skinsRepaired = 0
-        var attributesRepaired = 0
-        var namesRepaired = 0
-        var restacked = 0
-        var skinlessGuesses = 0
-        var repairedBoxContents = 0
-        var details = 0
-        var hidden = 0
-        val inventories = arrayOf(player.inventory, player.enderChest)
+        val report = Report(player, !automatic)
         if (!automatic) {
             send(
                 player,
                 if (preview) {
-                    "§fインベントリとエンダーチェストの修復候補（§e確認のみ・変更しません§f）"
+                    "§fインベントリとエンダーチェストを確認しました §e（確認のみ・変更していません）"
                 } else {
-                    "§fインベントリとエンダーチェストを修復します"
+                    "§fインベントリとエンダーチェストを修復しました"
                 },
             )
         }
+        val inventories = arrayOf(player.inventory, player.enderChest)
         for (pass in inventories.indices) {
             val inventory = inventories[pass]
-            val enderChest = pass == 1
             for (slot in 0 until inventory.size) {
                 val item = inventory.getItem(slot) ?: continue
                 if (item.type.isAir || !item.hasItemMeta()) continue
-                inspected++
-                // A Storage Box keeps its content outside the inventory. Repair it with the same item
-                // repair, then write the box back (the box item itself is not a Mythic item).
+                report.inspected++
+                val place = "§7[${slotLabel(pass == 1, slot)}] §f${itemName(item)}"
+                // A Storage Box keeps its content outside the inventory; the box item is not a Mythic item.
                 val box = storageBoxBridge?.repair(item)
                 if (box != null) {
                     if (!preview) inventory.setItem(slot, box)
-                    repairedBoxContents++
-                    if (!automatic) {
-                        if (details < DETAIL_LIMIT) {
-                            player.sendMessage(
-                                "§a ✔ ${slotLabel(enderChest, slot)} §f${itemName(item)} §7→ §7中身を修復",
-                            )
-                            details++
-                        } else {
-                            hidden++
-                        }
-                    }
+                    report.repaired++
+                    report.line("§a ✔ $place §7… Storage Boxの中身を修復")
+                    continue
+                }
+                val contents = repairContents(item, matcher, itemConverter, 0)
+                if (contents != null) {
+                    if (!preview) inventory.setItem(slot, contents.item)
+                    report.repaired++
+                    report.line("§a ✔ $place §7… 中のアイテム ${contents.count}個を修復")
                     continue
                 }
                 when (val outcome = repairOne(item, matcher, itemConverter)) {
-                    RepairOutcome.NotMythic -> noMatch++ // ordinary items: counted, not listed
-                    is RepairOutcome.Excluded -> excludedCount++ // excluded MMIDs get no ID, Model or skin fixes
+                    RepairOutcome.NotMythic, is RepairOutcome.Excluded -> Unit
+                    is RepairOutcome.Reverted -> {
+                        if (!preview) inventory.setItem(slot, outcome.item)
+                        report.repaired++
+                        report.line("§a ✔ $place §7… §aバニラアイテムに戻す §7（${outcome.id} の定義がバニラ）")
+                    }
                     is RepairOutcome.MissingCurrent -> {
-                        missingCurrent++
-                        if (!automatic) {
-                            if (details < DETAIL_LIMIT) {
-                                player.sendMessage(
-                                    "§e ✘ ${slotLabel(enderChest, slot)} §f${itemName(item)}§7：ID ${outcome.id} が今のMMにありません",
-                                )
-                                details++
-                            } else {
-                                hidden++
-                            }
-                        }
+                        report.missingCurrent++
+                        report.line("§c ✘ $place §7… MMID ${outcome.id} が今のMMにありません")
                     }
                     is RepairOutcome.Done -> {
                         val result = outcome.result
-                        if (result.wasTagged) alreadyTagged++
-                        if (result.inferredWithoutSkin) skinlessGuesses++
-                        if (!result.changed) continue
-                        if (!automatic) {
-                            if (details < DETAIL_LIMIT) {
-                                val fixes = ArrayList<String>()
-                                if (result.needsId) fixes.add("MMID §a${result.id}")
-                                if (result.model != null) fixes.add("§7Model §a${result.model}")
-                                if (result.skinRestored) fixes.add("§7スキン §a復元")
-                                if (result.attributesRestored > 0) {
-                                    fixes.add("§7属性 §a${result.attributesRestored}件")
-                                }
-                                if (result.nameRestored) fixes.add("§7名前 §a${plain(result.fixed.displayName()!!)}")
-                                if (result.restacked) {
-                                    fixes.add("§7スタック §a${stackableParts(result.fixed, result.item)}")
-                                }
-                                player.sendMessage(
-                                    "§a ✔ ${slotLabel(enderChest, slot)} §f${itemName(item)} §7→ " +
-                                        fixes.joinToString("§7、") +
-                                        if (result.inferredWithoutSkin) " §e（スキン無し・名前とLoreで推定）" else "",
-                                )
-                                details++
-                            } else {
-                                hidden++
-                            }
+                        if (result.inferredWithoutSkin) report.skinlessGuesses++
+                        val stuck = result.canStack && !result.stacks
+                        if (stuck) report.notStacking++
+                        if (result.changed) {
+                            if (!preview) inventory.setItem(slot, result.item)
+                            report.repaired++
+                            report.line(
+                                "§a ✔ $place §7… " + fixSummary(result) +
+                                    (if (result.inferredWithoutSkin) " §e（スキン無し・名前とLoreで推定）" else "") +
+                                    (if (stuck) " §e※まだ重なりません" else ""),
+                            )
+                        } else if (stuck) {
+                            report.line("§e △ $place §7… 重なりません：" + result.stackReasons.joinToString("、"))
                         }
-                        if (!preview) inventory.setItem(slot, result.item)
-                        if (result.needsId) idsRepaired++
-                        if (result.model != null) modelsRepaired++
-                        if (result.skinRestored) skinsRepaired++
-                        if (result.attributesRestored > 0) attributesRepaired++
-                        if (result.nameRestored) namesRepaired++
-                        if (result.restacked) restacked++
                     }
                 }
             }
         }
-        val repaired = idsRepaired + modelsRepaired + skinsRepaired + attributesRepaired + namesRepaired +
-            restacked + repairedBoxContents
         if (automatic) {
-            if (repaired > 0) {
-                send(
-                    player,
-                    "§aインベントリを自動修復しました §7（MMID $idsRepaired・Model $modelsRepaired" +
-                        "・スキン $skinsRepaired・属性 $attributesRepaired・名前 $namesRepaired" +
-                        "・スタック $restacked・Storage Box $repairedBoxContents）",
-                )
+            if (report.repaired > 0) {
+                send(player, "§aインベントリのMMアイテムを ${report.repaired}個 自動修復しました §7（確認は /mmidfix check）")
             }
             return
         }
-        if (hidden > 0) player.sendMessage("§7 …ほか ${hidden}件")
+        report.finishLines()
         player.sendMessage(
-            "§f結果：" + (if (preview) "修復できるもの" else "修復したもの") + " §aMMID $idsRepaired" +
-                "§7・§aModel $modelsRepaired§7・§aスキン $skinsRepaired§7・§a属性 $attributesRepaired" +
-                "§7・§a名前 $namesRepaired§7・§aスタック $restacked§7・§aStorage Box $repairedBoxContents",
+            "§f" + (if (preview) "修復できるもの" else "修復") + " §a${report.repaired}§f個 §7/ " +
+                "§f重ならないもの §e${report.notStacking}§f個 §7/ 確認したアイテム ${report.inspected}個",
         )
-        player.sendMessage(
-            "§7確認 ${inspected}個（MMID付与済み $alreadyTagged・MMアイテムではない/一致なし " +
-                "$noMatch・今のMMに無いID $missingCurrent・除外 $excludedCount）",
-        )
-        if (skinlessGuesses > 0) {
-            player.sendMessage(
-                "§eスキンが失われたヘッド $skinlessGuesses" +
-                    "個は名前とLoreだけで推定しています。上の候補を確認してください。",
+        if (report.missingCurrent > 0) {
+            player.sendMessage("§c今のMMに無いIDのアイテムが ${report.missingCurrent}個あります。§7MM側の定義を確認してください。")
+        }
+        if (report.skinlessGuesses > 0) {
+            player.sendMessage("§eスキンが失われたヘッド ${report.skinlessGuesses}個は名前とLoreから推定しています。")
+        }
+        when {
+            report.repaired == 0 && report.notStacking == 0 && report.missingCurrent == 0 ->
+                player.sendMessage("§a修復が必要なアイテムはありません。")
+            preview && report.repaired > 0 -> player.sendMessage("§7修復するには §e/mmidfix")
+        }
+        if (report.notStacking > 0) {
+            player.sendMessage("§7重ならない理由の詳細は、そのアイテムを手に持って §e/mmidfix hand")
+        }
+    }
+
+    private class ContentRepair(val item: ItemStack, val count: Int)
+
+    /**
+     * A copy of a shulker box or bundle with the items inside repaired (recursively), or null when
+     * nothing inside changes. [item] is not modified.
+     */
+    @Suppress("UnstableApiUsage")
+    private fun repairContents(
+        item: ItemStack,
+        matcher: CurrentLegacyDefinitionMatcher,
+        itemConverter: ItemConverter,
+        depth: Int,
+    ): ContentRepair? {
+        if (depth > 4) return null
+        if (!item.hasData(DataComponentTypes.CONTAINER) && !item.hasData(DataComponentTypes.BUNDLE_CONTENTS)) {
+            return null
+        }
+        val copy = item.clone()
+        val meta = copy.itemMeta ?: return null
+        var count = 0
+        if (meta is BlockStateMeta && meta.hasBlockState()) {
+            val state = meta.blockState as? Container ?: return null
+            val inventory = state.inventory
+            for (slot in 0 until inventory.size) {
+                val nested = inventory.getItem(slot) ?: continue
+                val repaired = repairNested(nested, matcher, itemConverter, depth) ?: continue
+                inventory.setItem(slot, repaired.item)
+                count += repaired.count
+            }
+            if (count == 0) return null
+            meta.blockState = state
+        } else if (meta is BundleMeta && meta.hasItems()) {
+            val items = meta.items.map { nested ->
+                val repaired = repairNested(nested, matcher, itemConverter, depth)
+                if (repaired != null) count += repaired.count
+                repaired?.item ?: nested
+            }
+            if (count == 0) return null
+            meta.setItems(items)
+        } else {
+            return null
+        }
+        copy.itemMeta = meta
+        return ContentRepair(copy, count)
+    }
+
+    private fun repairNested(
+        nested: ItemStack,
+        matcher: CurrentLegacyDefinitionMatcher,
+        itemConverter: ItemConverter,
+        depth: Int,
+    ): ContentRepair? {
+        if (nested.type.isAir || !nested.hasItemMeta()) return null
+        repairContents(nested, matcher, itemConverter, depth + 1)?.let { return it }
+        storageBoxBridge?.repair(nested)?.let { return ContentRepair(it, 1) }
+        val outcome = repairOne(nested, matcher, itemConverter)
+        if (outcome is RepairOutcome.Reverted) return ContentRepair(outcome.item, 1)
+        val result = (outcome as? RepairOutcome.Done)?.result ?: return null
+        return if (result.changed) ContentRepair(result.item, 1) else null
+    }
+
+    private fun fixSummary(result: RepairResult): String {
+        val fixes = ArrayList<String>()
+        if (result.needsId) fixes.add("MMID付与（${result.id}）")
+        if (result.model != null) fixes.add("Model復元")
+        if (result.skinRestored) fixes.add("スキン復元")
+        if (result.attributesRestored > 0) fixes.add("属性${result.attributesRestored}件復元")
+        if (result.nameRestored) fixes.add("名前復元")
+        if (result.restacked) {
+            val parts = StackNormalizer.differingComponents(result.fixed, result.item).map(StackNormalizer::label)
+            fixes.add(
+                "重なるよう整形" + if (parts.isEmpty()) "" else "（" + parts.take(4).joinToString("・") +
+                    (if (parts.size > 4) "…" else "") + "）",
             )
         }
-        if (repaired == 0) {
-            player.sendMessage(
-                if (missingCurrent == 0) {
-                    "§a修復が必要なアイテムはありません。"
-                } else {
-                    "§e今のMMに無いIDのアイテムは修復できません。MM側の定義を確認してください。"
-                },
-            )
-        } else if (preview) {
-            player.sendMessage("§7実行するには §e/mmidfix inventory")
-        }
+        return "§a" + fixes.joinToString("§7、§a")
     }
 
     /**
@@ -577,10 +683,15 @@ class MythicItemFixer : JavaPlugin() {
         itemConverter: ItemConverter,
     ): RepairOutcome {
         val meta = item.itemMeta ?: return RepairOutcome.NotMythic
-        var id = meta.persistentDataContainer.get(ItemConverter.TYPE, PersistentDataType.STRING)
-        val needsId = id == null || id.trim().isEmpty()
-        if (needsId) id = matcher.match(item)
+        var id = meta.persistentDataContainer.get(ItemConverter.TYPE, PersistentDataType.STRING)?.trim()
+        val needsId = id.isNullOrEmpty()
+        if (needsId) {
+            // MythicMobs 4 MYTHIC_TYPE tag first, then the 1.15.2 / current definition match
+            id = itemConverter.bridge.read(item.clone())?.mythicType?.trim()?.takeIf { it.isNotEmpty() }
+                ?: matcher.match(item)
+        }
         if (id == null) return RepairOutcome.NotMythic
+        ItemConverter.vanillaOf(item, id, exclusions)?.let { return RepairOutcome.Reverted(id, it) }
         if (exclusions.isExcluded(id)) return RepairOutcome.Excluded(id)
         val current = itemConverter.bridge.currentItem(id) ?: return RepairOutcome.MissingCurrent(id)
         val legacyName = matcher.legacyNameFor(id)
@@ -617,21 +728,23 @@ class MythicItemFixer : JavaPlugin() {
         if (restoreAttributes) restoreAttributes(fixedMeta, missingAttributes)
         if (wantedName != null) fixedMeta.displayName(wantedName)
         fixed.itemMeta = fixedMeta
-        val stackable = itemConverter.normalizer.normalize(fixed, id, legacyName)
-        val restack = stackable != null
+        val analysis = itemConverter.normalizer.analyze(fixed, id, legacyName, matcher.legacyLoreFor(id))
+        val stackable = analysis.result
         return RepairOutcome.Done(
             RepairResult(
                 id = id,
-                item = if (restack) stackable!! else fixed,
+                item = stackable ?: fixed,
                 fixed = fixed,
                 needsId = needsId,
-                wasTagged = !needsId,
                 model = model,
                 skinRestored = skinRestored,
                 attributesRestored = missingAttributes.size(),
                 nameRestored = wantedName != null,
-                restacked = restack,
+                restacked = stackable != null,
                 inferredWithoutSkin = inferredWithoutSkin,
+                canStack = analysis.canStack,
+                stacks = analysis.stacks,
+                stackReasons = analysis.reasons,
             ),
         )
     }
@@ -640,6 +753,9 @@ class MythicItemFixer : JavaPlugin() {
         object NotMythic : RepairOutcome
         data class Excluded(val id: String) : RepairOutcome
         data class MissingCurrent(val id: String) : RepairOutcome
+
+        /** The MMID's definition is a plain vanilla item: [item] is that vanilla item without MM tags. */
+        class Reverted(val id: String, val item: ItemStack) : RepairOutcome
         data class Done(val result: RepairResult) : RepairOutcome
     }
 
@@ -648,21 +764,45 @@ class MythicItemFixer : JavaPlugin() {
         val item: ItemStack,
         val fixed: ItemStack,
         val needsId: Boolean,
-        val wasTagged: Boolean,
         val model: Int?,
         val skinRestored: Boolean,
         val attributesRestored: Int,
         val nameRestored: Boolean,
         val restacked: Boolean,
         val inferredWithoutSkin: Boolean,
+        /** Whether the item can stack at all (max stack size > 1). */
+        val canStack: Boolean,
+        /** Whether [item] stacks with `/mm i get`. */
+        val stacks: Boolean,
+        /** Why [item] still does not stack with `/mm i get`. */
+        val stackReasons: List<String>,
     ) {
         val changed: Boolean
             get() = needsId || model != null || skinRestored || attributesRestored > 0 || nameRestored || restacked
     }
 
     private fun reloadExclusions() {
-        exclusions = MmidExclusions.parse(config.getStringList("excluded-mmids"))
+        var loaded = MmidExclusions.parse(config.getStringList("excluded-mmids"))
+        val itemConverter = converter
+        if (itemConverter != null && config.getBoolean("exclude-vanilla-definitions", true)) {
+            loaded = loaded.withVanillaDefinitions(vanillaDefinitions(itemConverter.bridge))
+        }
+        exclusions = loaded
         logger.info("Excluded MMIDs: ${exclusions.summary()}")
+    }
+
+    /** IDs whose current definition generates a plain vanilla item (see [MmidExclusions]). */
+    private fun vanillaDefinitions(bridge: MythicItemBridge): List<String> {
+        val ids = ArrayList<String>()
+        for (id in bridge.allIds()) {
+            val item = bridge.currentItem(id) ?: continue
+            try {
+                if (StackNormalizer.isVanillaEquivalent(item)) ids.add(id)
+            } catch (_: RuntimeException) {
+                // unreadable definition: leave it to the normal rules
+            }
+        }
+        return ids
     }
 
     private fun reloadLegacyMatcher() {
@@ -682,12 +822,12 @@ class MythicItemFixer : JavaPlugin() {
             )
             legacyMatcher = loaded
             legacyMatcherError = null
-            itemConverter.setLegacyNames(loaded::legacyNameFor)
+            itemConverter.setLegacyMatcher(loaded)
             logger.info("Legacy item definitions loaded: ${loaded.summary()}")
         } catch (error: IOException) {
             legacyMatcher = null
             legacyMatcherError = error.message
-            itemConverter.setLegacyNames(null)
+            itemConverter.setLegacyMatcher(null)
             logger.warning(
                 "Automatic inventory repair is unavailable: $legacyMatcherError" +
                     ". Copy the 1.15.2 Items contents to plugins/MythicItemFixer/legacy-mythic-items/.",
@@ -790,7 +930,7 @@ class MythicItemFixer : JavaPlugin() {
         private const val PERM_ADMIN = "mythicitemfixer.admin"
 
         /** Subcommands every player may run on their own items. */
-        private val PLAYER_SUBCOMMANDS = listOf("help", "hand", "inventory")
+        private val PLAYER_SUBCOMMANDS = listOf("check", "hand", "help")
 
         /** Server-wide subcommands. */
         private val ADMIN_SUBCOMMANDS = listOf("status", "reload", "scan", "offline", "worldscan")
@@ -798,18 +938,23 @@ class MythicItemFixer : JavaPlugin() {
         /** Item lines shown per run; the rest are counted only. */
         private const val DETAIL_LIMIT = 12
 
+        /** Characters of a component value shown by `/mmidfix hand`. */
+        private const val SHORTEN_LIMIT = 120
+
         private fun send(sender: CommandSender, message: String) {
             sender.sendMessage(PREFIX + message)
         }
 
         private fun help(sender: CommandSender) {
             send(sender, "§fコマンド一覧")
-            sender.sendMessage("§e/mmidfix hand §7… 手持ちアイテムのMMIDを確認・付与")
             sender.sendMessage(
-                "§e/mmidfix inventory preview §7… 自分のインベントリとエンダーチェストの修復候補を表示（変更なし）",
+                "§e/mmidfix §7… インベントリとエンダーチェストのMMアイテムを修復" +
+                    "（シュルカー・バンドル・Storage Boxの中身も）",
             )
-            sender.sendMessage("§e/mmidfix inventory §7… 自分のインベントリとエンダーチェストを修復")
+            sender.sendMessage("§e/mmidfix check §7… 何が修復されるか・重ならないアイテムを確認だけする（変更なし）")
+            sender.sendMessage("§e/mmidfix hand §7… 手持ちのアイテムを修復し、/mm i get と違う部分を詳しく表示")
             if (!sender.hasPermission(PERM_ADMIN)) return
+            sender.sendMessage("§6管理者用")
             sender.sendMessage("§e/mmidfix status §7… 処理件数と旧定義の読込状況")
             sender.sendMessage("§e/mmidfix reload §7… 設定と旧定義を読み直す")
             sender.sendMessage("§e/mmidfix scan §7… オンラインプレイヤーと読込済みチャンクを走査")
@@ -824,18 +969,8 @@ class MythicItemFixer : JavaPlugin() {
 
         private fun errorCount(errors: Long): String = (if (errors > 0) "§c" else "§f") + errors + "§7件"
 
-        /** Which of name / lore / custom_data the stack fix changes, for the preview line. */
-        private fun stackableParts(before: ItemStack, after: ItemStack): String {
-            val parts = ArrayList<String>()
-            val a = before.itemMeta
-            val b = after.itemMeta
-            if (a.displayName() != b.displayName()) parts.add("名前の装飾")
-            if (a.lore() != b.lore()) parts.add("Loreの装飾")
-            if (a.persistentDataContainer.keys != b.persistentDataContainer.keys || parts.isEmpty()) {
-                parts.add("MMデータ")
-            }
-            return parts.joinToString("・")
-        }
+        private fun shorten(text: String): String =
+            if (text.length <= SHORTEN_LIMIT) text else text.substring(0, SHORTEN_LIMIT) + "…"
 
         private fun slotLabel(enderChest: Boolean, slot: Int): String {
             if (enderChest) return "エンダーチェスト${slot + 1}"

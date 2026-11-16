@@ -22,16 +22,17 @@ class ItemConverter(
     private val storageBoxRepair: ((ItemStack) -> ItemStack?)? = null,
 ) {
     val normalizer = StackNormalizer(bridge::currentItem)
-    private var legacyNames: ((String) -> String?)? = null
+    private var legacyMatcher: CurrentLegacyDefinitionMatcher? = null
     private var checked = 0L
     private var normalized = 0L
     private var converted = 0L
     private var excluded = 0L
     private var errors = 0L
+    private var reverted = 0L
 
-    /** The 1.15.2 definition name per ID, used to recognise MM names that were renamed since. */
-    fun setLegacyNames(legacyNames: ((String) -> String?)?) {
-        this.legacyNames = legacyNames
+    /** The 1.15.2 definitions, used to recognise MM names and lore that were changed since. */
+    fun setLegacyMatcher(matcher: CurrentLegacyDefinitionMatcher?) {
+        legacyMatcher = matcher
     }
 
     fun convert(item: ItemStack?): Int = convert(item, 0)
@@ -48,6 +49,7 @@ class ItemConverter(
                 // result only when the ID is not excluded
                 val copy = item.clone()
                 val legacy = bridge.read(copy)
+                if (legacy != null && revertVanilla(item, legacy.mythicType)) return 1
                 if (legacy != null) {
                     if (exclusions().isExcluded(legacy.mythicType)) {
                         excluded++
@@ -60,6 +62,7 @@ class ItemConverter(
                     }
                 }
             }
+            if (!id.isNullOrEmpty() && revertVanilla(item, id)) return 1
             if (!id.isNullOrEmpty() && !exclusions().isExcluded(id)) {
                 changes += normalize(item, id)
             }
@@ -70,6 +73,18 @@ class ItemConverter(
             if (errors <= 10) errorLogger(exception)
         }
         return changes
+    }
+
+    /**
+     * Turns an item back into the plain vanilla item when its MMID's current definition is a plain
+     * vanilla item and the item carries nothing but MythicMobs' tags (see [vanillaOf]).
+     */
+    private fun revertVanilla(item: ItemStack, id: String): Boolean {
+        val plain = vanillaOf(item, id, exclusions()) ?: return false
+        item.itemMeta = plain.itemMeta
+        reverted++
+        convertedLogger("$id (reverted to vanilla)")
+        return true
     }
 
     /** Repairs the content of a Storage Box in place (see [MythicItemFixer.repairItem]). */
@@ -85,7 +100,12 @@ class ItemConverter(
 
     /** Makes an item with an ID stack with `/mm i get` items (see [StackNormalizer]). */
     private fun normalize(item: ItemStack, id: String): Int {
-        val result = normalizer.normalize(item, id, legacyNames?.invoke(id)) ?: return 0
+        val result = normalizer.normalize(
+            item,
+            id,
+            legacyMatcher?.legacyNameFor(id),
+            legacyMatcher?.legacyLoreFor(id),
+        ) ?: return 0
         result.itemMeta?.let { item.itemMeta = it }
         normalized++
         return 1
@@ -143,9 +163,22 @@ class ItemConverter(
     fun getExcluded(): Long = excluded
     fun getErrors(): Long = errors
     fun getNormalized(): Long = normalized
+    fun getReverted(): Long = reverted
 
     companion object {
         @JvmField
         val TYPE = NamespacedKey("mythicmobs", "type")
+
+        /**
+         * The plain vanilla item [item] should be, or null: only when [id]'s current definition is a
+         * plain vanilla item ([MmidExclusions.isVanillaDefinition]), [item] has nothing but MythicMobs'
+         * tags on top of the vanilla item, and those tags are actually there to remove.
+         */
+        @JvmStatic
+        fun vanillaOf(item: ItemStack, id: String, exclusions: MmidExclusions): ItemStack? {
+            if (!exclusions.isVanillaDefinition(id) || !StackNormalizer.isVanillaEquivalent(item)) return null
+            val plain = ItemStack(item.type, item.amount)
+            return if (plain.isSimilar(item)) null else plain
+        }
     }
 }

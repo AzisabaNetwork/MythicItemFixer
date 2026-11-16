@@ -20,67 +20,105 @@ import java.util.Optional
 /**
  * Makes a Mythic item stack with a freshly generated one (`/mm i get`) when the two differ only in
  * how the same content is encoded: 1.15.2 items converted to 1.21 carry the name and lore as plain
- * strings (no `italic:false`, no colour component) and lack the `custom_data` MythicMobs 5 writes.
+ * strings (no `italic:false`, no colour component), lack the `custom_data` MythicMobs 5 writes, and
+ * often carry `tooltip_display` / model / attribute components written differently.
  *
- * Only three components can be taken from the current definition:
+ * Taken from the current definition:
  * - `custom_name`: when the item has none, or the same text (colours/formatting lost), or the 1.15.2
  *   definition's name. An anvil rename is kept.
- * - `lore`: only when every line has exactly the same text. Lore that differs in text (levels, stats
- *   written in the lore) is kept as is, and the item is not rebuilt at all.
+ * - `lore`: when every line has the same text as the current or the 1.15.2 definition. Lore that
+ *   differs otherwise (levels, stats written in the lore) means the item is not rebuilt at all.
  * - `custom_data`: when it holds nothing but Bukkit PDC, MythicMobs 4 leftovers (`MYTHIC_*`,
  *   `Prevent*`) and keys the current item has too. PDC entries of other plugins are carried over.
+ * - `profile` (player heads): when the skin textures are identical and only the UUID/name differs.
+ * - For items that stack (max stack size > 1) also the components only the definition sets
+ *   ([DEFINITION_COMPONENTS]: tooltip_display, model, attributes, unbreakable, ...).
  *
- * `profile` (player heads) is taken only when the skin textures are identical and just the profile
- * UUID/name differs. Every other component (enchantments, damage, attributes, model, ...) stays the
- * item's own.
- * Definitions that generate a different item each time (random stats) are never used.
+ * Everything a player can change on one item (enchantments, damage, repair cost, trims, contents,
+ * ...) stays the item's own. Definitions that generate a different item each time (random stats)
+ * are never used.
  */
 class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
     private val templates = HashMap<String, Optional<ItemStack>>()
+    private val templateProblems = HashMap<String, String>()
     private val templateKeys = java.util.IdentityHashMap<ItemStack, Optional<Set<String>>>()
 
     /** Forgets the generated items, for after MythicMobs' definitions were reloaded. */
     fun clearCache() {
         templates.clear()
+        templateProblems.clear()
         templateKeys.clear()
     }
+
+    /**
+     * What [analyze] found: [result] is the rebuilt item (null when nothing changes or it cannot be
+     * done safely), [stacks] whether the item (rebuilt or not) now stacks with `/mm i get`, and
+     * [reasons] why it does not (only for items that can stack at all).
+     */
+    class Analysis(
+        val result: ItemStack?,
+        val stacks: Boolean,
+        val reasons: List<String>,
+        /** False for items that never stack (max stack size 1), where [stacks] means nothing. */
+        val canStack: Boolean = true,
+    )
 
     /**
      * The item rebuilt so it stacks with the current definition's item, or null when nothing would
      * change or it cannot be done safely. [item] itself is not modified.
      */
-    fun normalize(item: ItemStack?, id: String?, legacyName: String?): ItemStack? {
-        if (item == null || item.type.isAir || id == null) return null
-        val template = template(id) ?: return null
-        if (template.type != item.type) return null
-        if (item.amount > template.maxStackSize) return null
-        if (template.isSimilar(item)) return null // already stacks
+    fun normalize(item: ItemStack?, id: String?, legacyName: String?, legacyLore: List<String>? = null): ItemStack? =
+        analyze(item, id, legacyName, legacyLore).result
+
+    fun analyze(item: ItemStack?, id: String?, legacyName: String?, legacyLore: List<String>? = null): Analysis {
+        if (item == null || item.type.isAir || id == null) return Analysis(null, false, emptyList(), false)
+        val template = template(id)
+            ?: return Analysis(null, false, listOf(templateProblems[normalizeId(id)] ?: "今のMMの定義を生成できません"))
+        val canStack = template.maxStackSize > 1
+        fun refuse(reason: String) = Analysis(null, false, if (canStack) listOf(reason) else emptyList(), canStack)
+        if (template.type != item.type) return refuse("素材が違います（今の定義は ${template.type}）")
+        if (item.amount > template.maxStackSize) return refuse("個数が今の定義の最大スタック数を超えています")
+        if (template.isSimilar(item)) return Analysis(null, true, emptyList(), canStack) // already stacks
         val itemId = item.persistentDataContainer.get(ItemConverter.TYPE, PersistentDataType.STRING)
-        if (itemId != null && !itemId.trim().equals(id, ignoreCase = true)) return null
+        if (itemId != null && !itemId.trim().equals(id, ignoreCase = true)) return refuse("MMIDが違います")
         return try {
-            if (!customDataReplaceable(item, template)) return null
+            val foreign = foreignCustomData(item, template)
+            if (foreign == null) return refuse("custom_dataを読めません")
+            if (foreign.isNotEmpty()) return refuse("他のプラグインのデータがあります（${foreign.joinToString()}）")
             // Lore whose text differs is item-specific (Lv1/Lv2, rolled stats, ...). Do not rebuild
             // the item in that case: replacing custom_data would also drop the lore stored there.
-            if (!loreReplaceable(item, template)) return null
+            if (!loreReplaceable(item, template, legacyLore)) return refuse("Loreの文章が今の定義と違います")
 
-            val result = template.clone()
-            result.copyDataFrom(item) { type -> key(type) !in OWN_COMPONENTS }
-            for (type in template.dataTypes) {
-                if (key(type) !in OWN_COMPONENTS && !item.hasData(type)) result.unsetData(type)
+            val sameSkin = sameSkin(item, template)
+            val fromTemplate = { k: String ->
+                k in OWN_COMPONENTS || k == PROFILE && sameSkin || canStack && k in DEFINITION_COMPONENTS
             }
-            // Same skin under a different profile UUID/name (heads generated at different times)
-            if (sameSkin(item, template)) copy(template, result, DataComponentTypes.PROFILE)
+            val result = template.clone()
+            result.copyDataFrom(item) { type -> !fromTemplate(key(type)) }
+            for (type in template.dataTypes) {
+                if (!fromTemplate(key(type)) && !item.hasData(type)) result.unsetData(type)
+            }
             if (!nameReplaceable(item, template, legacyName)) copy(item, result, DataComponentTypes.CUSTOM_NAME)
             carryPersistentData(item, template, result)
             result.amount = item.amount
-            if (result.isSimilar(item)) null else result
-        } catch (_: RuntimeException) {
-            null
+            val changed = !result.isSimilar(item)
+            val final = if (changed) result else item
+            if (!canStack || final.isSimilar(template)) {
+                Analysis(if (changed) result else null, canStack, emptyList(), canStack)
+            } else {
+                val reasons = differingComponents(final, template).map { "${label(it)}が違います" }
+                Analysis(if (changed) result else null, false, reasons.ifEmpty { listOf("PDCが違います") })
+            }
+        } catch (error: RuntimeException) {
+            refuse("確認中にエラー：${error.javaClass.simpleName}")
         }
     }
 
-    private fun template(id: String): ItemStack? {
-        val key = id.trim().lowercase(Locale.ROOT)
+    private fun normalizeId(id: String): String = id.trim().lowercase(Locale.ROOT)
+
+    /** The item `/mm i get` gives for [id] (cached), or null when it is missing or random. */
+    fun template(id: String): ItemStack? {
+        val key = normalizeId(id)
         var cached = templates[key]
         if (cached == null) {
             cached = Optional.ofNullable(generate(id))
@@ -90,16 +128,23 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
     }
 
     private fun generate(id: String): ItemStack? {
-        val first = currentItem(id) ?: return null
-        val second = currentItem(id) ?: return null
-        if (first.type.isAir) return null
+        val first = currentItem(id)
+        val second = currentItem(id)
+        if (first == null || second == null || first.type.isAir) {
+            templateProblems[normalizeId(id)] = "今のMMにこのIDの定義がありません"
+            return null
+        }
         if (!first.isSimilar(second)) {
             // A head whose profile UUID is generated per item is still one definition when the skin
             // is the same; anything else differing is a random definition and a swap would reroll it.
-            if (!sameSkin(first, second)) return null
             val aligned = second.clone()
-            copy(first, aligned, DataComponentTypes.PROFILE)
-            if (!first.isSimilar(aligned)) return null
+            if (sameSkin(first, second)) copy(first, aligned, DataComponentTypes.PROFILE)
+            if (!first.isSimilar(aligned)) {
+                val random = differingComponents(first, aligned).joinToString { label(it) }
+                templateProblems[normalizeId(id)] =
+                    "今の定義は毎回違うアイテムを生成します（${random.ifEmpty { "ランダム要素" }}）"
+                return null
+            }
         }
         return first.clone().apply { amount = 1 }
     }
@@ -127,9 +172,11 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
         return plain == plain(wanted) || legacyName != null && plain == stripLegacy(legacyName)
     }
 
-    private fun loreReplaceable(item: ItemStack, template: ItemStack): Boolean =
-        plainLines(item.getData(DataComponentTypes.LORE)) ==
-            plainLines(template.getData(DataComponentTypes.LORE))
+    private fun loreReplaceable(item: ItemStack, template: ItemStack, legacyLore: List<String>?): Boolean {
+        val have = plainLines(item.getData(DataComponentTypes.LORE))
+        return have == plainLines(template.getData(DataComponentTypes.LORE)) ||
+            legacyLore != null && have == legacyLore.map(::stripLegacy)
+    }
 
     private fun plainLines(lore: ItemLore?): List<String> =
         lore?.lines()?.map(::plain) ?: emptyList()
@@ -150,21 +197,19 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
         }
     }
 
-    /** True when replacing the item's custom_data with the current one loses nothing but MM data. */
-    private fun customDataReplaceable(item: ItemStack, template: ItemStack): Boolean {
-        val keys = customDataKeys(item) ?: return false
-        if (keys.isEmpty()) return true
+    /**
+     * Top-level custom_data keys that replacing it with the current one would lose (other plugins'
+     * data), empty when only MM data / vanilla leftovers are there, null when unreadable.
+     */
+    private fun foreignCustomData(item: ItemStack, template: ItemStack): List<String>? {
+        val keys = customDataKeys(item) ?: return null
+        if (keys.isEmpty()) return emptyList()
         val wanted = templateKeys.getOrPut(template) { Optional.ofNullable(customDataKeys(template)) }
-            .orElse(null) ?: return false
-        for (key in keys) {
-            if (key in wanted || key == "PublicBukkitValues" || key == "display" ||
-                key.startsWith("MYTHIC") || key.startsWith("Prevent")
-            ) {
-                continue
-            }
-            return false
+            .orElse(null) ?: return null
+        return keys.filter { key ->
+            key !in wanted && key !in REPLACEABLE_CUSTOM_DATA &&
+                !key.startsWith("MYTHIC") && !key.startsWith("Prevent")
         }
-        return true
     }
 
     /** Top-level keys of the item's custom_data, empty when it has none, null when unreadable. */
@@ -184,7 +229,96 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
         private const val CUSTOM_DATA = "minecraft:custom_data"
         private const val CUSTOM_NAME = "minecraft:custom_name"
         private const val LORE = "minecraft:lore"
+        private const val PROFILE = "minecraft:profile"
         private val OWN_COMPONENTS = setOf(CUSTOM_DATA, CUSTOM_NAME, LORE)
+
+        /**
+         * custom_data keys that are safe to drop: Bukkit PDC (carried over separately) and 1.15.2 tags
+         * the data fixer already turned into components, left behind as dead copies.
+         */
+        private val REPLACEABLE_CUSTOM_DATA = setOf(
+            "PublicBukkitValues", "display", "HideFlags", "Unbreakable", "CustomModelData",
+            "AttributeModifiers", "Enchantments", "SkullOwner", "CanDestroy", "CanPlaceOn",
+        )
+
+        /**
+         * Components only the MM definition sets, never a player on one item. For stackable items they
+         * are taken from the current definition so old encodings (HideFlags → tooltip_display, old
+         * models, attribute modifiers written by MM4) do not keep the stacks apart.
+         */
+        private val DEFINITION_COMPONENTS = setOf(
+            "minecraft:tooltip_display", "minecraft:custom_model_data", "minecraft:item_model",
+            "minecraft:unbreakable", "minecraft:attribute_modifiers", "minecraft:enchantment_glint_override",
+            "minecraft:rarity", "minecraft:item_name", "minecraft:max_stack_size", "minecraft:max_damage",
+            "minecraft:food", "minecraft:consumable", "minecraft:use_remainder", "minecraft:use_cooldown",
+            "minecraft:tooltip_style", "minecraft:can_break", "minecraft:can_place_on",
+            "minecraft:damage_resistant", "minecraft:equippable", "minecraft:glider",
+            "minecraft:break_sound", "minecraft:weapon", "minecraft:tool", "minecraft:repairable",
+            "minecraft:enchantable", "minecraft:hide_tooltip", "minecraft:hide_additional_tooltip",
+        )
+
+        private val LABELS = mapOf(
+            CUSTOM_DATA to "MMデータ(custom_data)", CUSTOM_NAME to "名前", LORE to "Lore",
+            PROFILE to "ヘッドのスキン", "minecraft:enchantments" to "エンチャント",
+            "minecraft:stored_enchantments" to "本のエンチャント", "minecraft:damage" to "耐久値",
+            "minecraft:repair_cost" to "金床の使用歴", "minecraft:trim" to "装飾(trim)",
+            "minecraft:dyed_color" to "染色", "minecraft:tooltip_display" to "表示設定(HideFlags)",
+            "minecraft:custom_model_data" to "Model", "minecraft:item_model" to "ItemModel",
+            "minecraft:attribute_modifiers" to "属性", "minecraft:unbreakable" to "耐久無限",
+            "minecraft:enchantment_glint_override" to "エンチャントの光", "minecraft:container" to "中身",
+            "minecraft:bundle_contents" to "バンドルの中身", "minecraft:potion_contents" to "ポーション効果",
+        )
+
+        /**
+         * True when the item is a plain vanilla item apart from MythicMobs' own tags: no component
+         * differs from `ItemStack(type)` except a custom_data holding nothing but `mythicmobs:` PDC and
+         * MythicMobs 4 leftovers (`MYTHIC_*`, `Prevent*`).
+         */
+        @JvmStatic
+        fun isVanillaEquivalent(item: ItemStack): Boolean {
+            if (item.type.isAir) return false
+            val vanilla = ItemStack(item.type)
+            for (key in differingComponents(item, vanilla)) {
+                if (key != CUSTOM_DATA) return false
+                val data = components(item)[CUSTOM_DATA] ?: continue
+                val keys = when {
+                    data.isJsonObject -> data.asJsonObject.keySet()
+                    data.isJsonPrimitive -> snbtKeys(data.asString) ?: return false
+                    else -> return false
+                }
+                if (keys.any { it != "PublicBukkitValues" && !it.startsWith("MYTHIC") && !it.startsWith("Prevent") }) {
+                    return false
+                }
+                if (item.persistentDataContainer.keys.any { it.namespace != "mythicmobs" }) return false
+            }
+            return true
+        }
+
+        /** A short Japanese name for a component key such as `minecraft:lore`. */
+        @JvmStatic
+        fun label(key: String): String = LABELS[key] ?: key.removePrefix("minecraft:")
+
+        /** Component keys whose value differs between the two items (count is ignored). */
+        @Suppress("DEPRECATION")
+        @JvmStatic
+        fun differingComponents(a: ItemStack, b: ItemStack): List<String> {
+            val ca = components(a)
+            val cb = components(b)
+            val keys = LinkedHashSet<String>()
+            keys.addAll(ca.keys)
+            keys.addAll(cb.keys)
+            return keys.filter { ca[it] != cb[it] }
+        }
+
+        /** The item's components as JSON, keyed like `minecraft:lore` (count ignored). */
+        @Suppress("DEPRECATION")
+        @JvmStatic
+        fun components(item: ItemStack): Map<String, JsonElement> {
+            val json = Bukkit.getUnsafe().serializeItemAsJson(item.clone().apply { amount = 1 })
+            val components = json.get("components")
+            if (components == null || !components.isJsonObject) return emptyMap()
+            return components.asJsonObject.entrySet().associate { it.key to it.value }
+        }
 
         /** Top-level keys of an SNBT compound such as `{a:{b:1},"c d":[1,2]}`, or null if malformed. */
         @JvmStatic

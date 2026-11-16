@@ -17,6 +17,10 @@ online-player-scan-interval-ticks: 200
 chunks-per-tick: 2
 full-world-chunks-per-tick: 1
 log-converted-items: false
+# Treat every MMID whose current MythicMobs definition generates a plain vanilla item (nothing but
+# MythicMobs' own mythicmobs:* tags) as excluded, so ordinary items are never turned into Mythic items
+# that no longer stack with vanilla ones. Re-evaluated on /mmidfix reload.
+exclude-vanilla-definitions: true
 # MMIDs this plugin will never fix (no ID from the old tag, no ID/Model/skin/attribute/name repair).
 # Matching ignores case. An entry ending in * matches every MMID starting with it.
 #   - SomeItem      exact match
