@@ -262,7 +262,6 @@ class MythicItemFixer : JavaPlugin() {
     ): Boolean {
         val sub = when (val first = args.firstOrNull()?.lowercase(Locale.ROOT)) {
             null, "fix" -> "fix"
-            // old spellings
             "inventory", "inv" -> if (args.getOrNull(1).equals("preview", ignoreCase = true)) "check" else "fix"
             "preview" -> "check"
             else -> first
@@ -326,6 +325,11 @@ class MythicItemFixer : JavaPlugin() {
         alias: String,
         args: Array<out String>,
     ): List<String> {
+        if (args.size == 2 && args[0].lowercase(Locale.ROOT) in setOf("inventory", "inv") &&
+            sender.hasPermission(PERM_USE)
+        ) {
+            return matching(listOf("preview"), args[1])
+        }
         if (args.size != 1) return emptyList()
         val options = ArrayList<String>()
         if (sender.hasPermission(PERM_USE)) options.addAll(PLAYER_SUBCOMMANDS)
@@ -666,7 +670,7 @@ class MythicItemFixer : JavaPlugin() {
         if (result.restacked) {
             val parts = StackNormalizer.differingComponents(result.fixed, result.item).map(StackNormalizer::label)
             fixes.add(
-                "重なるよう整形" + if (parts.isEmpty()) "" else "（" + parts.take(4).joinToString("・") +
+                (if (result.canStack) "重なるよう整形" else "今の定義に整形") + if (parts.isEmpty()) "" else "（" + parts.take(4).joinToString("・") +
                     (if (parts.size > 4) "…" else "") + "）",
             )
         }
@@ -930,7 +934,7 @@ class MythicItemFixer : JavaPlugin() {
         private const val PERM_ADMIN = "mythicitemfixer.admin"
 
         /** Subcommands every player may run on their own items. */
-        private val PLAYER_SUBCOMMANDS = listOf("check", "hand", "help")
+        private val PLAYER_SUBCOMMANDS = listOf("inventory", "check", "hand", "help")
 
         /** Server-wide subcommands. */
         private val ADMIN_SUBCOMMANDS = listOf("status", "reload", "scan", "offline", "worldscan")
@@ -951,6 +955,7 @@ class MythicItemFixer : JavaPlugin() {
                 "§e/mmidfix §7… インベントリとエンダーチェストのMMアイテムを修復" +
                     "（シュルカー・バンドル・Storage Boxの中身も）",
             )
+            sender.sendMessage("§e/mmidfix inventory [preview] §7… /mmidfix と同じ（preview は /mmidfix check と同じ）")
             sender.sendMessage("§e/mmidfix check §7… 何が修復されるか・重ならないアイテムを確認だけする（変更なし）")
             sender.sendMessage("§e/mmidfix hand §7… 手持ちのアイテムを修復し、/mm i get と違う部分を詳しく表示")
             if (!sender.hasPermission(PERM_ADMIN)) return

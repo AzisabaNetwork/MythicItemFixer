@@ -79,11 +79,12 @@ SearchableInfiniteShop の取引も同じ規則で、該当するMMIDの取引�
 
 ## コマンド
 
-`/mmidfix`・`check`・`hand`・`help` は権限 `mythicitemfixer.use`(既定で全員)、それ以外は `mythicitemfixer.admin`(既定OP)が必要です。
+`/mmidfix`・`inventory`・`check`・`hand`・`help` は権限 `mythicitemfixer.use`(既定で全員)、それ以外は `mythicitemfixer.admin`(既定OP)が必要です。
 
 | コマンド | 権限 | 内容 |
 |:--|:--|:--|
 | `/mmidfix` | use | 自分のインベントリとエンダーチェストを修復(シュルカー・バンドル・Storage Boxの中身も) |
+| `/mmidfix inventory [preview]` | use | `/mmidfix` と同じ(`preview` 付きは `/mmidfix check` と同じ) |
 | `/mmidfix check` | use | 何が修復されるか・重ならないアイテムとその理由を表示(変更しない) |
 | `/mmidfix hand` | use | 手持ちのアイテムを修復し、`/mm i get` と違う部分を値付きで表示 |
 | `/mmidfix status` | admin | 処理件数と旧定義の読込状況 |

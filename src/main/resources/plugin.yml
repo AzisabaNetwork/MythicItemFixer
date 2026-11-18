@@ -9,10 +9,10 @@ description: Keeps MythicMobs 4.12 item IDs working on 1.21.11 / MythicMobs 5.
 commands:
   mmidfix:
     description: MythicItemFixer migration commands
-    usage: /mmidfix [check|hand|help|status|reload|scan|offline|worldscan]
+    usage: /mmidfix [inventory|check|hand|help|status|reload|scan|offline|worldscan]
 permissions:
   mythicitemfixer.use:
-    description: /mmidfix, check, hand, help (repair your own items)
+    description: /mmidfix, inventory, check, hand, help (repair your own items)
     default: true
   mythicitemfixer.admin:
     description: /mmidfix status, reload, scan, offline, worldscan

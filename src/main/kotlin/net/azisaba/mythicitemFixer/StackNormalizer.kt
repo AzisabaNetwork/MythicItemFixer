@@ -72,8 +72,11 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
 
     fun analyze(item: ItemStack?, id: String?, legacyName: String?, legacyLore: List<String>? = null): Analysis {
         if (item == null || item.type.isAir || id == null) return Analysis(null, false, emptyList(), false)
-        val template = template(id)
-            ?: return Analysis(null, false, listOf(templateProblems[normalizeId(id)] ?: "今のMMの定義を生成できません"))
+        val template = template(id) ?: run {
+            val stackable = item.maxStackSize > 1
+            val reason = templateProblems[normalizeId(id)] ?: "今のMMの定義を生成できません"
+            return Analysis(null, false, if (stackable) listOf(reason) else emptyList(), stackable)
+        }
         val canStack = template.maxStackSize > 1
         fun refuse(reason: String) = Analysis(null, false, if (canStack) listOf(reason) else emptyList(), canStack)
         if (template.type != item.type) return refuse("素材が違います（今の定義は ${template.type}）")
@@ -90,8 +93,12 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
             if (!loreReplaceable(item, template, legacyLore)) return refuse("Loreの文章が今の定義と違います")
 
             val sameSkin = sameSkin(item, template)
+            // Modifiers that differ only in their ids (MythicMobs rolls them per item, 1.15.2 items keep
+            // their old UUIDs) are the same attributes, so even unstackable items take the current ids.
+            val sameAttributes = sameAttributesIgnoringIds(item, template)
             val fromTemplate = { k: String ->
-                k in OWN_COMPONENTS || k == PROFILE && sameSkin || canStack && k in DEFINITION_COMPONENTS
+                k in OWN_COMPONENTS || k == PROFILE && sameSkin || k == ATTRIBUTE_MODIFIERS && sameAttributes ||
+                    canStack && k in DEFINITION_COMPONENTS
             }
             val result = template.clone()
             result.copyDataFrom(item) { type -> !fromTemplate(key(type)) }
@@ -136,9 +143,11 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
         }
         if (!first.isSimilar(second)) {
             // A head whose profile UUID is generated per item is still one definition when the skin
-            // is the same; anything else differing is a random definition and a swap would reroll it.
+            // is the same, and so are attribute modifiers whose ids MythicMobs rolls per item; anything
+            // else differing is a random definition and a swap would reroll it.
             val aligned = second.clone()
             if (sameSkin(first, second)) copy(first, aligned, DataComponentTypes.PROFILE)
+            if (sameAttributesIgnoringIds(first, second)) copy(first, aligned, DataComponentTypes.ATTRIBUTE_MODIFIERS)
             if (!first.isSimilar(aligned)) {
                 val random = differingComponents(first, aligned).joinToString { label(it) }
                 templateProblems[normalizeId(id)] =
@@ -153,6 +162,30 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
     private fun sameSkin(a: ItemStack, b: ItemStack): Boolean {
         val skin = skin(a.getData(DataComponentTypes.PROFILE) ?: return false)
         return skin.isNotEmpty() && skin == skin(b.getData(DataComponentTypes.PROFILE) ?: return false)
+    }
+
+    /** True when both items' attribute modifiers are the same apart from the modifier ids. */
+    private fun sameAttributesIgnoringIds(a: ItemStack, b: ItemStack): Boolean {
+        val ca = components(a)[ATTRIBUTE_MODIFIERS] ?: return false
+        val cb = components(b)[ATTRIBUTE_MODIFIERS] ?: return false
+        return withoutIds(ca) == withoutIds(cb)
+    }
+
+    /** A copy of [json] with every `id` field of the modifiers removed. */
+    private fun withoutIds(json: JsonElement): JsonElement {
+        val copy = json.deepCopy()
+        fun strip(element: JsonElement) {
+            when {
+                element.isJsonObject -> {
+                    val obj = element.asJsonObject
+                    obj.remove("id")
+                    for ((_, value) in obj.entrySet()) strip(value)
+                }
+                element.isJsonArray -> element.asJsonArray.forEach(::strip)
+            }
+        }
+        strip(copy)
+        return copy
     }
 
     private fun skin(profile: ResolvableProfile): Set<Pair<String, String>> =
@@ -230,6 +263,7 @@ class StackNormalizer(private val currentItem: (String) -> ItemStack?) {
         private const val CUSTOM_NAME = "minecraft:custom_name"
         private const val LORE = "minecraft:lore"
         private const val PROFILE = "minecraft:profile"
+        private const val ATTRIBUTE_MODIFIERS = "minecraft:attribute_modifiers"
         private val OWN_COMPONENTS = setOf(CUSTOM_DATA, CUSTOM_NAME, LORE)
 
         /**
